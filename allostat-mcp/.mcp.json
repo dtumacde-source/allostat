@@ -1,0 +1,12 @@
+{
+  "allostat-mcp": {
+    "type": "http",
+    "url": "https://mcp.allostat.ai/mcp",
+    "headers": {
+      "Authorization": "Bearer ${ALLOSTAT_MCP_TOKEN}",
+      "Accept": "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      "User-Agent": "allostat-mcp-wrapper/0.1.10 (+https://allostat.ai)"
+    }
+  }
+}

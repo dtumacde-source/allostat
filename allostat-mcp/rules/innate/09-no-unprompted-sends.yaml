@@ -1,0 +1,46 @@
+id: innate-09
+name: Never send email or post to public channels unprompted
+severity: lethal
+tier: innate
+description: >
+  Any operation that publishes content (email send, social media post,
+  forum post, public comment, broadcast message, mass communication)
+  requires explicit chat confirmation. Reading inboxes is fine; sending
+  is not. Applies to remote agents too — even if a remote agent has
+  general permission to operate, "send" operations are gated each time.
+trigger:
+  match_any:
+    - operation: smtp_send
+    - operation: gmail_send
+    - operation: outlook_send
+    - operation: post_to_social
+      platforms: [twitter, x, reddit, linkedin, facebook, instagram, threads, mastodon, bluesky]
+    - operation: post_to_forum
+    - operation: publish_blog_post
+    - operation: broadcast_message
+    - operation: mass_email
+    - operation: webhook_send_with_payload
+      check: payload_is_communication
+response:
+  action: hard_pause
+  display: red_box
+  message: |
+    ⛔ UNPROMPTED SEND BLOCKED
+
+    Detected: {operation_type}
+    Recipient(s): {recipients}
+    Content preview: {preview}
+
+    Sending content publicly or to others requires your explicit confirmation
+    each time. To proceed, confirm in chat:
+      "Yes, send {short_description}"
+
+    If you want to grant standing authorization for a specific channel
+    (e.g., 'always allow drafts to my-list@example.com'), say so and I'll
+    add it as a learned rule. Send-without-confirmation is never a default.
+exception_required: explicit_chat_confirmation_per_send
+why_lethal: >
+  Unsent emails are recoverable; sent emails are not. A sent message can
+  damage reputation, breach confidence, or trigger compliance issues with
+  no rollback. Mass-send incidents have ended companies. Source: Dom's
+  CLAUDE.md (never send email unprompted, applies to remote agents too).

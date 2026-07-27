@@ -1,0 +1,43 @@
+Allostat — Proprietary Software License
+
+Copyright (c) 2026 Health Professions Data LLC. All rights reserved.
+
+WHAT YOU MAY DO
+
+This repository is the official distribution channel for the Allostat plugin.
+You are granted a limited, personal, non-transferable right to download,
+install, and use the Allostat client on your own devices while your Allostat
+subscription is active, including installation through the Claude Code plugin
+marketplace or the official installers at installer.allostat.ai.
+
+You may also read this source. Allostat runs inside your coding agent and can
+act on your session, so you are entitled to see what it does.
+
+WHAT YOU MAY NOT DO
+
+Except as expressly permitted above, or where the law grants you a right
+regardless, you may not: redistribute, publish, sublicense, sell, rent, or
+otherwise transfer the software or any part of it; modify it or create
+derivative works; reverse-engineer it; remove or alter this notice; or give
+others access to the hosted service through your subscription.
+
+THE SERVICE
+
+The client connects to a hosted service. Access to that service is governed by
+your subscription and by the Terms of Service at https://allostat.ai/terms and
+the Privacy Policy at https://allostat.ai/privacy, which control if anything
+here conflicts with them. Ending your subscription ends the rights granted
+above, except that you may keep and use any content Allostat produced for you.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. Allostat's safety checks
+are best-effort: they can miss what they were meant to catch and can flag things
+that are fine. They do not replace your own judgment, testing, backups, security
+review, or version control. IN NO EVENT SHALL HEALTH PROFESSIONS DATA LLC BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION
+WITH THE SOFTWARE OR ITS USE.
+
+Licensing inquiries: support@allostat.ai

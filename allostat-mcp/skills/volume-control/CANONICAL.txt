@@ -1,0 +1,4 @@
+CANONICAL — this is the source-of-truth folder for the volume-control
+pillar skill. Each pillar lives in its own folder under skills/; sibling
+folders (hypothalamic-axis, stress-response, etc.) are distinct pillars,
+NOT duplicates of this content. PATCH-102.

@@ -1,0 +1,121 @@
+id: innate-02
+name: Always require explicit confirmation before destructive commands
+severity: lethal
+tier: innate
+description: >
+  Any command capable of permanent data loss (rm -rf, git reset --hard, force
+  push, drop table, purge, force delete) requires explicit chat confirmation.
+  Operator authorization once is not standing authorization for future
+  invocations — each destructive action gets its own confirmation.
+trigger:
+  match_any:
+    # Recursive/forced `rm`, EVERY spelling (2026-07-21).
+    #
+    # This used to be the two literal strings `rm\s+-rf` and `rm\s+-fr`, so
+    # `rm -r dir`, `rm -f -r dir`, `rm -rvf dir`, `rm -Rf dir` and
+    # `rm --recursive --force dir` all passed a LETHAL gate in silence. The
+    # DEGRADED fallback in lib/innate_rules.py (_FALLBACK_DESTRUCTIVE_PATTERNS)
+    # already caught all of them, which meant a customer whose ruleset was
+    # CORRUPT was better protected than one whose ruleset was healthy. The
+    # armed rule now uses the fallback's own form, so the armed set is a
+    # superset of the degraded set (asserted by
+    # tests/test_innate02_recursive_delete_spellings.py).
+    # The `(?<!-)` keeps `docker build --rm -f Dockerfile .` (a real, common,
+    # non-destructive command) out of a LETHAL gate.
+    - command_pattern: "(?<!-)\\brm\\s+-[a-zA-Z]*[rf][a-zA-Z]*\\b"
+      case_sensitive: false
+    - command_pattern: "(?<!-)\\brm\\s+(-[a-zA-Z]*\\s+)*--(recursive|force)\\b"
+      case_sensitive: false
+    - command_pattern: "git\\s+reset\\s+--hard"
+    - command_pattern: "git\\s+push\\s+.*--force"
+    - command_pattern: "git\\s+push\\s+.*-f\\b"
+    # Refspec force-push (2026-07-21). `git push origin +main` is a complete
+    # force push — it is the form git's own documentation uses — and neither
+    # flag pattern above sees it. why_lethal names overwriting teammates'
+    # commits as the reason this rule is lethal; the `+` spelling does exactly
+    # that.
+    - command_pattern: "git\\s+push\\s+[^|;&]*\\s\\+\\S"
+    - command_pattern: "git\\s+branch\\s+-D"
+    - command_pattern: "git\\s+clean\\s+-(f|x)"
+    - command_pattern: "git\\s+checkout\\s+(--|\\.)"
+    - command_pattern: "git\\s+restore\\s+\\."
+    - command_pattern: "DROP\\s+TABLE"
+      case_sensitive: false
+    - command_pattern: "DROP\\s+DATABASE"
+      case_sensitive: false
+    # Word-bounded (R3 follow-up, 2026-07-20). This was a bare unanchored
+    # "TRUNCATE" with case_sensitive: false, so the ordinary English words
+    # "truncated", "truncating" and "truncation" fired a LETHAL rule. Observed
+    # live three times in one session, twice on `git commit` messages that were
+    # describing a truncated file, and once on a `grep` for this very pattern.
+    # False positives are the top usability risk for this guard: an operator who
+    # learns the red box is usually wrong is an operator who stops reading it.
+    # The trailing \b excludes every English inflection while keeping the bare
+    # SQL statement, which is the thing worth confirming.
+    - command_pattern: "\\bTRUNCATE\\b"
+      case_sensitive: false
+    - command_pattern: "format\\s+/[a-zA-Z]:"
+    # Windows forms (2026-07-06, codex slice-5 live-validation finding):
+    # Windows agents compose PowerShell/cmd deletes — Codex's shell IS
+    # powershell.exe, and Claude Code has a PowerShell tool — so the
+    # bash-only set silently missed them. Same bar as `rm -rf`:
+    # recursive/forced deletes confirm; plain single-file deletes don't.
+    #
+    # Widened 2026-07-21. The old pattern was
+    #   \b(Remove-Item|rm|ri)\b(?=.*-Recurse\b)(?=.*-Force\b)
+    # which required the two parameters spelled out IN FULL and required BOTH.
+    # PowerShell accepts any unambiguous parameter PREFIX and several aliases,
+    # so `Remove-Item -r -fo x`, `Remove-Item -rec -fo x`,
+    # `del -Recurse -Force x`, `rd -Recurse -Force x`,
+    # `erase -Recurse -Force x` and `Remove-Item -Recurse x` (no -Force at all —
+    # it still deletes the tree) every one passed the gate. This is the
+    # operator's own shell and every Windows customer's.
+    # `(?<!-)` so a FLAG spelled `-ri` / `-del` is not read as the cmdlet name.
+    - command_pattern: "(?<!-)\\b(Remove-Item|ri|rm|rd|rmdir|del|erase)\\b[^|;&]*\\s-{1,2}r(e(c(u(r(s(e)?)?)?)?)?)?\\b"
+      case_sensitive: false
+    # `Get-ChildItem -Recurse <path> | Remove-Item` — the pipeline spelling of a
+    # recursive delete. The verb and the -Recurse live in different segments, so
+    # the single-segment pattern above cannot see it.
+    - command_pattern: "\\b(Get-ChildItem|gci)\\b[^;&]*\\s-{1,2}r(e(c(u(r(s(e)?)?)?)?)?)?\\b[^;&]*\\b(Remove-Item|ri|del|erase)\\b"
+      case_sensitive: false
+    # .NET recursive directory delete reachable from PowerShell.
+    - command_pattern: "\\[[^\\]]*Directory\\]::Delete"
+      case_sensitive: false
+    - command_pattern: "\\b(rd|rmdir)\\b(?=.*/s\\b)"
+      case_sensitive: false
+    - command_pattern: "\\bdel\\b(?=.*/s\\b)"
+      case_sensitive: false
+response:
+  action: hard_pause
+  display: red_box
+  message: |
+    ⛔ DESTRUCTIVE COMMAND DETECTED — innate-02 fired
+
+    Command: {command}
+    Target: {target}
+    Reversibility: {reversibility}
+
+    Why this fired: rule innate-02 matches commands capable of
+    permanent data loss (rm -rf, force push, drop table, etc.).
+    See rules/innate/02-destructive-confirmation.yaml for the pattern set.
+
+    How to proceed:
+
+      Type `allostat: override` in your next message to authorize THIS
+      one command. Consent is single-use — the guard re-arms immediately
+      after, so every destructive command gets its own confirmation.
+
+      (Legacy escapes still exist for non-interactive/bench use:
+      ALLOSTAT_INNATE_OVERRIDES env var, or editing this rule file.)
+
+    The override is logged to .allostat/observations.jsonl as
+    innate_rule_overridden — forensics preserved regardless of which
+    path you choose.
+
+    If unsure what's about to be deleted/lost, ask the agent to explain
+    BEFORE setting the override.
+exception_required: env_var_override_or_rule_edit
+why_lethal: >
+  Lost work measured in hours-to-days of recovery. Force-pushed branches
+  may overwrite teammates' commits. Dropped tables = data loss with no
+  recovery without backups.

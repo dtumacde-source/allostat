@@ -1,0 +1,13 @@
+{
+  "name": "allostat-mcp",
+  "version": "1.4.77",
+  "description": "Allostat \u2014 allostatic regulator for AI agents. Autonomic memory governance, drift correction, and operator-state integration. Fires via hooks; no agent invocation required.",
+  "author": {
+    "name": "Dominick Tumacder",
+    "email": "support@allostat.ai"
+  },
+  "publisher": {
+    "name": "Health Professions Data LLC",
+    "url": "https://allostat.ai"
+  }
+}

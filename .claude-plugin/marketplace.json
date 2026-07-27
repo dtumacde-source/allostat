@@ -1,0 +1,17 @@
+{
+  "name": "allostat",
+  "description": "Allostat — allostatic regulator for AI agents. Autonomic memory governance, drift correction, and operator-state integration for Claude Code.",
+  "owner": {
+    "name": "Dominick Tumacder",
+    "email": "support@allostat.ai"
+  },
+  "plugins": [
+    {
+      "name": "allostat-mcp",
+      "description": "Hosted-MCP wrapper for Allostat. Thin Claude Code plugin that routes hook events to the regulator brain at mcp.allostat.ai while keeping all operator memory client-side.",
+      "source": "./allostat-mcp",
+      "version": "1.4.77",
+      "homepage": "https://allostat.ai"
+    }
+  ]
+}
