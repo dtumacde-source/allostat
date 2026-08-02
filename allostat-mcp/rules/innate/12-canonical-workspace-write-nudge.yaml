@@ -62,12 +62,18 @@ response:
     ║              referenced as project source-of-truth)
     ║    [cancel] Don't write
     ║
-    ║  To proceed without prompt: phrase "write to downloads anyway —
-    ║  this is a one-off" (logged exception)
+    ║  This is ADVISORY — severity `high` surfaces the box but does
+    ║  not block, so the write proceeds. Tell me to redirect and I
+    ║  will move it; say it is a genuine one-off and I will leave it.
     ╚══════════════════════════════════════════════════════════════╝
 
-  exception_phrase_template: |
-    "write to downloads anyway — this is a one-off"
+# The line above replaced "To proceed without prompt: phrase 'write to
+# downloads anyway — this is a one-off'" on 2026-07-30. That phrase was read
+# by no code (grep it), and it promised a bypass for a rule that never blocked
+# in the first place — `is_refusal_severity` gates on lethal/critical, and this
+# rule is `high`. Both halves of the sentence were false.
+# Its `exception_phrase_template` twin went with it: dead key, ruleset-wide.
+# See tests/test_innate_advertised_remedy_is_real.py.
 
 failure_mode_prevented:
   description: |

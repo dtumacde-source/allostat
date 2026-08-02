@@ -222,6 +222,37 @@ def parse_project_slug(filename: str) -> str | None:
     return raw
 
 
+# Files that live in a handoff search location but are NOT continuity handoffs
+# (2026-07-30, advisor brief). Discovery globbed `*.md` with no filter, so both
+# of these were candidates — and both are ranked by mtime alongside the real
+# thing, so either can win and become "the last handoff" in the session-start
+# banner.
+#
+#   *_session_end.md   session-end AUDIT (session_handoff.py:647). Its own
+#                      template body says "NOT a continuity handoff". Setting
+#                      ALLOSTAT_HANDOFF_DIR makes this systematic rather than
+#                      incidental: the override steers audit WRITES and handoff
+#                      SEARCH to one directory while rolling-handoff writes stay
+#                      canonical, so the searched-first directory fills with
+#                      audits and nothing else.
+#   *.detail.md        the A3 overflow sibling of `<session_id>.md`. Carries
+#                      verbose free text only — never the six load-bearing
+#                      sections, never the resume core.
+#
+# Deliberately an EXCLUSION list, not the `YYYYMMDD_<slug>_handoff.md`
+# convention this module's docstring describes: every rolling handoff actually
+# on disk is named `<session_id>.md`, so enforcing the documented shape would
+# discover zero handoffs while looking like a correctness fix. Pinned both ways
+# by tests/test_handoff_discovery_excludes_non_handoffs.py.
+_NON_HANDOFF_SUFFIXES = ("_session_end.md", ".detail.md")
+
+
+def is_handoff_filename(filename: str) -> bool:
+    """False for markdown files that share a handoff folder but are not one."""
+    lowered = filename.lower()
+    return not any(lowered.endswith(suffix) for suffix in _NON_HANDOFF_SUFFIXES)
+
+
 def _format_age(age_hours: float) -> str:
     """Human-readable age. < 24h = h; < 168h = d; else weeks."""
     if age_hours < 24:
@@ -284,6 +315,8 @@ def discover_handoffs(
         if not folder.exists():
             continue
         for handoff in folder.glob("*.md"):
+            if not is_handoff_filename(handoff.name):
+                continue
             try:
                 resolved = str(handoff.resolve()).lower()
                 if resolved in seen:

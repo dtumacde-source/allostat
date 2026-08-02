@@ -2589,12 +2589,137 @@ def _main() -> int:
         except Exception as e:
             emit_stderr(f"sandbox enforcement check failed: {e}")
 
+    # FINDING 9 (audit 2026-07-30) — INNATE path rules for SHELL writes.
+    #
+    # The top innate gate (~:2460) keys on file_path, which a shell command does
+    # not have, and classifies Bash as operation=None. The comment above
+    # `_op_map` states the assumption that made this look deliberate:
+    #
+    #     Bash leaves operation as None -- Bash rules trigger on
+    #     command_pattern, not operation.
+    #
+    # True for COMMAND rules (rule 02), false for PATH rules, and that gap is
+    # the whole defect. Measured before the fix: an Edit to a canonical-ambiguous
+    # target was hard-refused while `echo x > <same target>` was ALLOWED, and the
+    # same held for an existing `.env` — so innate-01, the secrets guard, did not
+    # see shell writes either. Not just innate-04: NO path rule did.
+    #
+    # This is the same gate the Codex patch path already has (~:2678, H-11), for
+    # the same reason its comment gives: "the explicit-file_path match above
+    # never saw these". Shell writes are the third surface that reaches the
+    # filesystem without a file_path.
+    #
+    # operation="edit" deliberately, matching the patch gate: it is the single
+    # value that satisfies rule 01/03's `[write, edit]` gate AND rule 04's
+    # match_all `operation: edit`. command=None so rule 02 is not re-evaluated —
+    # the top gate already saw the real command; no double-fire.
+    #
+    # UNRESOLVED TARGETS ARE NOT CLOSED HERE (audit finding 10). If any target
+    # needs runtime expansion, `_bash_write_targets` raises and this gate sees
+    # NOTHING — including the targets it could have resolved. Refusing outright
+    # would hard-deny ordinary shell work (`cp src/*.py backup/`,
+    # `mv "$SRC" "$DST"`), which is how an operator ends up leaving a blanket
+    # override on permanently — the exact failure that makes a guard protect
+    # nothing. So it is logged, not refused, and the residual gap is measurable
+    # rather than invisible. Choosing the fail-closed boundary is a product
+    # decision, deliberately not made unilaterally here.
+    if tool_name and tool_name.lower() in ("bash", "shell") and command:
+        try:
+            from innate_rules import match_pre_tool_call, is_refusal_severity  # noqa: E402
+            try:
+                _bash_innate_targets = _bash_write_targets(command)
+            except _UnresolvedBashWriteTarget:
+                _bash_innate_targets = []
+                if state_dir is not None:
+                    append_observation(
+                        state_dir,
+                        "innate_unresolved_bash_write_allowed",
+                        details={
+                            "reason": "target_needs_runtime_expansion",
+                            "command_excerpt": redact_secrets(command or "")[:200],
+                        },
+                    )
+            for _bt in _bash_innate_targets:
+                _bt_flags: list[str] = []
+                _bt_siblings: list[str] = []
+                try:
+                    from filesystem_context import detect_canonical_context  # noqa: E402
+                    _bfs = detect_canonical_context(_bt)
+                    if _bfs.flags:
+                        _bt_flags = sorted(_bfs.flags)
+                        _bt_siblings = list(_bfs.sibling_folder_names)
+                except Exception as e:
+                    emit_stderr(f"bash-target canonical context failed: {e}")
+                _bm = match_pre_tool_call(
+                    tool_name=tool_name,
+                    command=None,
+                    file_path=_bt,
+                    operation="edit",
+                    context_flags=set(_bt_flags),
+                    sibling_list=_bt_siblings,
+                )
+                if (_bm is not None and not _bm.overridden
+                        and is_refusal_severity(_bm.severity)):
+                    # One-shot consent parity with the explicit-path and patch
+                    # gates: an armed token clears this refusal exactly as it
+                    # clears an Edit, or the operator would face a refusal their
+                    # override provably cannot lift.
+                    if _claimed_token is None and state_dir is not None:
+                        try:
+                            from innate_consent import consume_atomically  # noqa: E402
+                            _claimed_token = consume_atomically(state_dir)
+                        except Exception as e:  # noqa: BLE001
+                            emit_stderr(f"innate consent check failed (bash): {e}")
+                            _claimed_token = None
+                        if _claimed_token is not None:
+                            _pending_override = {
+                                "rule_id": _bm.rule_id,
+                                "rule_name": _bm.rule_name,
+                                "severity": _bm.severity,
+                                "tool_name": tool_name,
+                                "file_path": _bt,
+                                "command_excerpt": redact_secrets(command or "")[:200],
+                                "via": "prompt_consent_bash",
+                            }
+                    if _claimed_token is not None:
+                        continue
+                    if state_dir is not None:
+                        append_observation(state_dir, "innate_rule_fired", details={
+                            "rule_id": _bm.rule_id,
+                            "rule_name": _bm.rule_name,
+                            "severity": _bm.severity,
+                            "response_action": _bm.response_action,
+                            "tool_name": tool_name,
+                            "file_path": _bt,
+                            "refused": True,
+                            "via": "bash_write_target",
+                        })
+                    _restore_consent_token(state_dir, _claimed_token)
+                    emit_stderr(
+                        f"Allostat innate rule {_bm.rule_id} refused (bash write): "
+                        f"{_bm.rule_name}"
+                    )
+                    return refuse_tool_call(
+                        _bm.formatted_message, hook_event="PreToolUse"
+                    )
+        except ImportError as e:
+            emit_stderr(f"innate bash-target check import failed: {e}")
+        except Exception as e:
+            emit_stderr(f"innate bash-target check failed: {e}")
+
     # C2 (Wave 3): the gate above keys on file_path, so a Bash command writing
     # into a sandbox-scoped tree via shell redirection (>, >>, tee, dd of=) —
     # tool_name "bash", no file_path — walked past it. Extract the write targets
     # and run each through the SAME sandbox deny gate. (MEMORY.md-cap-via-Bash
     # and non-tuple MCP write tools are a scoped Wave-3 follow-up.)
-    if tool_name and tool_name.lower() == "bash" and command:
+    #
+    # ("bash", "shell") not == "bash" (2026-08-01, carried from the 2026-07-30
+    # session's open findings): Codex's shell tool arrives as tool_name
+    # "shell", so the equality form scoped THIS gate to Claude Code only and
+    # Codex redirection writes bypassed sandbox scoping entirely. Same
+    # single-surface class as finding 9, same fix shape as the innate gate at
+    # the ("bash", "shell") check above.
+    if tool_name and tool_name.lower() in ("bash", "shell") and command:
         try:
             bash_targets = _bash_write_targets(command)
             from sandbox_perms import resolve_session_role, evaluate_write_permission  # noqa: E402

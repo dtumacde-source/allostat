@@ -10,7 +10,7 @@
       "name": "allostat-mcp",
       "description": "Hosted-MCP wrapper for Allostat. Thin Claude Code plugin that routes hook events to the regulator brain at mcp.allostat.ai while keeping all operator memory client-side.",
       "source": "./allostat-mcp",
-      "version": "1.4.77",
+      "version": "1.4.78",
       "homepage": "https://allostat.ai"
     }
   ]

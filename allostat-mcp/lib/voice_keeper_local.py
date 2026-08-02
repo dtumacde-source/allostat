@@ -108,12 +108,68 @@ DEFAULT_BANNED_TERMS: tuple[str, ...] = (
 )
 
 VOICE_SKILL_MAP: dict[str, str] = {
+    # Aggregate signals.
     "ai_slop_recent": "→ avoid slop markers next response",
     "sycophancy_recent": "→ no preamble, answer directly",
     "wall_of_text": "→ match brevity to question size",
     "advice_when_action_asked": "→ perform the action, don't advise",
+    # Last-resort fallback only. Before AR-01 this was what a reader got for
+    # EVERY non-slop, non-sycophancy violation — a category of concern plus a
+    # file to go re-read, with the actual measurement dropped. It fired 41
+    # times in one session and was correctly ignored all 41.
     "voice_drift_cumulative": "→ re-anchor on the project's voice reference file",
+    # Per-category guidance, keyed by the `category` values `evaluate_voice`
+    # actually emits (AR-01, 2026-07-30). Pinned by
+    # test_every_detectable_category_has_actionable_guidance so a new detector
+    # category cannot ship without something useful to say about it.
+    "ai_slop": "→ cut the slop marker, say the thing plainly",
+    "sycophancy": "→ drop the preamble, answer directly",
+    "hedge": "→ drop the hedge, state it plainly",
+    "corporate": "→ say it in plain English",
+    "banned_term": "→ drop the intensifier, let the fact carry it",
+    "em_dash_overuse": "→ fewer em-dashes; use commas, colons, or full stops",
+    "passive_voice": "→ name the actor, rewrite active",
 }
+
+# Worst-first. A turn commonly trips several rules and the nudge has room for
+# one, so the lead is chosen by severity rather than by scan order (which is
+# just the order `evaluate_voice` happens to append its scanners).
+_SEVERITY_RANK: dict[str, int] = {"high": 3, "medium": 2, "low": 1}
+
+
+def _describe_violation(violation: dict[str, Any]) -> str:
+    """One concrete phrase naming what was measured.
+
+    Prefers the `detail` stat string (em_dash_overuse / passive_voice compute
+    one). Marker-based categories carry no `detail`, so their marker and count
+    stand in — "'it's worth noting' ×2" is still a thing the reader can act on,
+    which "voice drift" is not.
+    """
+    detail = violation.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    marker = violation.get("marker")
+    if isinstance(marker, str) and marker.strip():
+        occurrences = violation.get("occurrences")
+        if isinstance(occurrences, int) and occurrences > 1:
+            return f"'{marker}' ×{occurrences}"
+        return f"'{marker}'"
+    return ""
+
+
+def _lead_violation(violations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The violation worth spending the line on: most severe, then most
+    frequent. Ties keep scan order, so the result is deterministic."""
+    ranked = [v for v in violations if isinstance(v, dict)]
+    if not ranked:
+        return None
+    return max(
+        ranked,
+        key=lambda v: (
+            _SEVERITY_RANK.get(str(v.get("severity") or "").lower(), 0),
+            v.get("occurrences") if isinstance(v.get("occurrences"), int) else 0,
+        ),
+    )
 
 SYCOPHANCY_MARKERS: tuple[str, ...] = (
     "you're absolutely right",
@@ -360,8 +416,31 @@ def compose_voice_nudge(
         return f"voice: ai_slop_recent ({examples}). {VOICE_SKILL_MAP['ai_slop_recent']}"
 
     if len(recent_violation_events) >= 3:
+        # AR-01 (2026-07-30). This branch used to emit the category name
+        # `voice_drift_cumulative`, a count, and a pointer to a reference file —
+        # and nothing about what was actually detected. Every one of the 41
+        # violations on 2026-07-27 came through here carrying a precise
+        # measurement that never reached the reader.
+        #
+        # The threshold is deliberately UNCHANGED (ticket: "MUST NOT change
+        # detection thresholds"), and so is the one-line budget. Only the
+        # content changed: lead with the finding, keep the aggregate count,
+        # and give guidance for the category actually detected instead of the
+        # generic re-anchor line.
+        count = len(recent_violation_events)
+        lead = _lead_violation(violations)
+        if lead is not None:
+            category = str(lead.get("category") or "").strip()
+            described = _describe_violation(lead)
+            guidance = VOICE_SKILL_MAP.get(
+                category, VOICE_SKILL_MAP["voice_drift_cumulative"]
+            )
+            headline = f"voice_drift_cumulative — {category}" if category else "voice_drift_cumulative"
+            if described:
+                headline = f"{headline}: {described}"
+            return f"voice: {headline} ({count} recent). {guidance}"
         return (
-            f"voice: voice_drift_cumulative ({len(recent_violation_events)} recent). "
+            f"voice: voice_drift_cumulative ({count} recent). "
             f"{VOICE_SKILL_MAP['voice_drift_cumulative']}"
         )
 

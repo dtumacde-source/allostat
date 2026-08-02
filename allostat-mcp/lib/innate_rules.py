@@ -51,6 +51,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -405,18 +406,25 @@ def _rule_content_hash(rule: dict) -> str:
 # Regenerate ONLY as part of a deliberate constitution change, in the same
 # commit as the rule edit. Pinned + mirrored server-side; parity-tested.
 EXPECTED_INNATE_RULE_HASHES: dict[str, str] = {
-    "innate-01": "e60b2a406b695c37e69c6ba33f272b895f213e78b4290fc0c57a4bd59a93bd11",
-    "innate-02": "1a051220aa386b5ffa9a160091523129455ee147d8338d7e02d910b94bdbe593",
-    "innate-03": "32e4b906b9688063564cefcaa6856f4dc697976ec8cef3aaf0b757bfe589eaf3",
-    "innate-04": "bd3dd79e6598148154b53587f5c2e7bc9bc0fb12b288b3563e1e106da0ed8400",
+    # 2026-07-30: seven rules re-pinned in one deliberate constitution change —
+    # 01/03/04/09/10 stopped printing exact-phrase remedies no code reads, and
+    # 11/12 dropped the dead `exception_phrase_template` key. See
+    # tests/test_innate_advertised_remedy_is_real.py for the invariant.
+    "innate-01": "99e40948c6ee006a95f977cdfb805ecf8c3cadb2448097043f9369e7fcd28f27",
+    # 2026-08-01: re-pinned for the destructive-operation registry (advisor
+    # H-03) — find -delete/shred/dd/truncate, interleaved-flag git deletes,
+    # and named aws/gh/wrangler/stripe/redis destructive operations.
+    "innate-02": "8749a19897af0fc411804872b5d3304f364514a34eea812e6bc602b7dee2333b",
+    "innate-03": "a5ae9415e2028c82ef8ce99f7d0b3592c42fa9d2a78b07efc57ebea0a25b857f",
+    "innate-04": "6b1ad53aa0f192f57942b477697f91ddc1d34329ad512a5008d5582626af0dba",
     "innate-05": "d657f3473e30bb2c37c01697d087cd0c8d34c0587ff3f4baba15296b07725afd",
     "innate-06": "c4f114cf62742061e333b63292cd7327e20eac5b597cf930c120ef9a735009d9",
     "innate-07": "793488571903147d9b951bab5aa61705cb74265076681454103ce75a77e58c50",
     "innate-08": "bee935b1b2eb8f27b958c4b970bb6e7441dce7c39a7f7ddfc287cea1c70d6d76",
-    "innate-09": "3997d25de33b628f8cbcf3f277fc5f97f81f004e2afaa0d9c119b96c4ed286cc",
-    "innate-10": "c8c587fb57924008b6f966537f61a3eb0a640365458f1f46897ba9725d1679a1",
-    "innate-11": "e77c1322c6682b5c21e46b3434a114f41a72deed5ef4ad17e40f8e3bfc36f808",
-    "innate-12": "82f172f8ad1924f4206755cfdcadc86de8743d7c50a4e63c400d050fd2c769f3",
+    "innate-09": "03c090b52c7dd5d623c4aa3cf911f7d2fb276901352c15d943581dfce870460f",
+    "innate-10": "b53f1292938104a95312feb9b06352852570934b885a4383ce0523b2a74887d1",
+    "innate-11": "87f750f50d575bd8b5fe6feb8223d83c4c0c953dcf35da25d1929115ad30d2d9",
+    "innate-12": "e27b1a2a71b4a7915ac79cda6d20bde6be0b7f2e39c6077fc2930889a9b5c563",
 }
 
 
@@ -504,10 +512,10 @@ def _entry_field_problem(key: str, val: Any) -> str | None:
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
             return None
         return f"threshold must be a positive number, got {val!r}"
-    if key == "case_sensitive":
+    if key in ("case_sensitive", "target_must_exist"):
         if isinstance(val, bool):
             return None
-        return f"case_sensitive must be a boolean, got {val!r}"
+        return f"{key} must be a boolean, got {val!r}"
     if key == "description":
         if isinstance(val, str):
             return None
@@ -1220,13 +1228,38 @@ def _operation_matches(required_op: Any, operation: str | None) -> bool:
     return required_op == operation
 
 
+def _target_exists_or_unknown(file_path: str) -> bool:
+    """True when the target exists OR its existence cannot be determined.
+
+    FAIL-SAFE, and the asymmetry is the whole point: only a definitive
+    "not found" is allowed to relax a lethal guard. Anything else — permission
+    denied, an invalid path, a filesystem error — counts as "it might be
+    there", so the rule keeps firing.
+
+    `Path.exists()` is deliberately NOT used here. It swallows every OSError
+    and returns False, so an existing-but-unreadable secrets file would read as
+    a create and walk straight through innate-01 — a strictly worse defect than
+    the false positive this gate exists to remove. `NotADirectoryError` is
+    treated as absent because a target whose parent is a file genuinely cannot
+    exist. Pinned by
+    tests/test_innate01_creates_are_not_overwrites.py::test_an_unreadable_target_still_refuses.
+    """
+    try:
+        os.stat(file_path)
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError, TypeError):
+        return True
+
+
 def _match_file_pattern(
     entry: dict,
     file_path: str,
     operation: str | None,
 ) -> bool:
     """Check if entry's `file_pattern` glob matches file_path, with
-    optional `operation` gating."""
+    optional `operation` gating and optional `target_must_exist` gating."""
     pat = entry.get("file_pattern")
     if not pat or not file_path:
         return False
@@ -1249,7 +1282,18 @@ def _match_file_pattern(
     if required_op and operation and not _operation_matches(required_op, operation):
         return False
     case_sensitive = entry.get("case_sensitive", False)
-    return _path_match(file_path, pat, case_sensitive=case_sensitive)
+    if not _path_match(file_path, pat, case_sensitive=case_sensitive):
+        return False
+    # `target_must_exist` (2026-07-30, advisor fix C): opt-in, and only
+    # innate-01 opts in. That rule is named "never OVERWRITE secrets" and its
+    # why_lethal is about losing existing keys, but it gated on glob+operation
+    # alone — so creating a brand-new credential file, the routine case, was
+    # refused with the same lethal hard-pause as clobbering a live one. A guard
+    # that is loudest where there is no risk teaches its operator to disable it.
+    # Checked LAST so the stat only happens on a path the rule already matched.
+    if entry.get("target_must_exist") and not _target_exists_or_unknown(file_path):
+        return False
+    return True
 
 
 def _match_all_satisfied(

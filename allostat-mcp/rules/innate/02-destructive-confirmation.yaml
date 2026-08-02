@@ -3,10 +3,13 @@ name: Always require explicit confirmation before destructive commands
 severity: lethal
 tier: innate
 description: >
-  Any command capable of permanent data loss (rm -rf, git reset --hard, force
-  push, drop table, purge, force delete) requires explicit chat confirmation.
-  Operator authorization once is not standing authorization for future
-  invocations — each destructive action gets its own confirmation.
+  Any command capable of permanent data loss requires explicit chat
+  confirmation — shell deletion in every spelling (rm, find -delete, shred,
+  dd, truncate), git history/branch destruction, SQL drops, AND named
+  destructive cloud operations (aws/gh/wrangler/stripe, keyed by
+  service+subcommand, never by a bare verb). Operator authorization once is
+  not standing authorization for future invocations — each destructive
+  action gets its own confirmation.
 trigger:
   match_any:
     # Recursive/forced `rm`, EVERY spelling (2026-07-21).
@@ -84,6 +87,85 @@ trigger:
     - command_pattern: "\\b(rd|rmdir)\\b(?=.*/s\\b)"
       case_sensitive: false
     - command_pattern: "\\bdel\\b(?=.*/s\\b)"
+      case_sensitive: false
+    # ------------------------------------------------------------------
+    # DESTRUCTIVE-OPERATION REGISTRY (2026-08-01, advisor H-03).
+    #
+    # Measured in one live session: this rule refused `rm -f` on a scratch
+    # file and said nothing about `find /etc/default ... -delete` (154
+    # credential files), `aws ec2 delete-volume`, or `aws rds
+    # delete-db-instance --skip-final-snapshot --delete-automated-backups`.
+    # The rule was an enumeration of spellings, so anything that destroys
+    # data with a spelling not on the list passed — and `git branch -q -D`
+    # passed because a cosmetic -q sat between the words the pattern
+    # expected to be adjacent.
+    #
+    # The entries below are a REGISTRY, not a word matcher: each is keyed on
+    # executable + service/subcommand + destructive flags (the advisor's
+    # explicit shape — a bare `delete` matcher over-blocks ordinary data
+    # operations and trains wholesale disabling). Two mechanics shared by
+    # all of them:
+    #
+    #   * COMMAND-POSITION ANCHOR: `(?:^|[\n;&|`]|\$\()` plus optional
+    #     sudo/command/env/VAR= prefixes. The executable must appear where a
+    #     command can actually start, so `echo "aws rds delete-db-instance"`
+    #     and a commit message QUOTING a dangerous string do not fire.
+    #     (The legacy entries above are deliberately unanchored — round-10
+    #     accepted their over-confirmation; nothing here relaxes them.)
+    #   * LOOKAHEAD FLAGS: destructive flags are matched with (?=[^\n;&|]*…)
+    #     inside the same pipeline segment, so flag ORDER and POSITION never
+    #     matter again. `git branch -q -D x`, `git branch x -D` and
+    #     `git branch -qD x` are the same operation and now the same match.
+    #
+    # Local filesystem — deletion that is not spelled `rm`:
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*find\\s(?=[^\\n;&|]*\\s-delete\\b)"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*find\\s(?=[^\\n;&|]*\\s-exec\\s+(?:rm|shred)\\b)"
+    # shred/truncate/mkfs carry the same command-position anchor as every
+    # other registry entry — `printf '%s' shred ...` is an argument, not a
+    # command, and the m08 decoy tests pin exactly that distinction.
+    # dd is deliberately ABSENT from this registry: `dd of=<target>` is
+    # already extracted by _bash_write_targets and routed through the
+    # sandbox deny gate and the path-based innate rules (the C2 machinery),
+    # which see the TARGET — a strictly better basis than the spelling.
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*shred\\s"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*truncate\\s(?=[^\\n;&|]*\\s(?:-s|--size))"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*mkfs(\\.\\w+)?\\b"
+    # git — the spellings the adjacency patterns above cannot see:
+    - command_pattern: "git\\s+branch(?=[^\\n;&|]*\\s-[a-zA-Z]*D\\b)"
+    - command_pattern: "git\\s+branch(?=[^\\n;&|]*\\s--delete\\b)(?=[^\\n;&|]*\\s--force\\b)"
+    - command_pattern: "git\\s+push(?=[^\\n;&|]*\\s(?:--delete|-d)\\b)"
+    - command_pattern: "git\\s+push\\s+[^\\n;&|]*\\s:\\S"
+    - command_pattern: "git\\s+stash\\s+(?:drop|clear)\\b"
+    - command_pattern: "git\\s+reflog\\s+expire"
+    - command_pattern: "git\\s+gc(?=[^\\n;&|]*\\s--prune)"
+    - command_pattern: "git\\s+update-ref(?=[^\\n;&|]*\\s-d\\b)"
+    - command_pattern: "git\\s+worktree\\s+remove(?=[^\\n;&|]*\\s--force\\b)"
+    # aws — named service + subcommand, never a bare verb (protective
+    # subcommands like `cancel-key-deletion` must NOT fire):
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?ec2\\s+(?:[^\\s;&|]+\\s+)*?(?:terminate-instances|delete-volume|delete-snapshot|deregister-image)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?rds\\s+(?:[^\\s;&|]+\\s+)*?delete-db-(?:instance|cluster|snapshot|cluster-snapshot)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?s3\\s+(?:[^\\s;&|]+\\s+)*?(?:rb|rm)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?s3api\\s+(?:[^\\s;&|]+\\s+)*?delete-(?:bucket|object|objects|bucket-policy)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?iam\\s+(?:[^\\s;&|]+\\s+)*?delete-(?:user|role|policy|group|instance-profile|access-key)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?kms\\s+(?:[^\\s;&|]+\\s+)*?(?:schedule-key-deletion|disable-key)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?backup\\s+(?:[^\\s;&|]+\\s+)*?delete-(?:backup-vault|backup-plan|recovery-point|backup-selection)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?logs\\s+(?:[^\\s;&|]+\\s+)*?delete-log-(?:group|stream)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?cloudformation\\s+(?:[^\\s;&|]+\\s+)*?delete-stack\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?dynamodb\\s+(?:[^\\s;&|]+\\s+)*?delete-table\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*aws\\s+(?:[^\\s;&|]+\\s+)*?ecr\\s+(?:[^\\s;&|]+\\s+)*?(?:delete-repository|batch-delete-image)\\b"
+    # gh — repo/release/secret destruction and the raw DELETE verb:
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*gh\\s+repo\\s+delete\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*gh\\s+release\\s+delete\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*gh\\s+(?:secret|variable)\\s+(?:delete|remove)\\b"
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*gh\\s+api(?=[^\\n;&|]*\\s(?:-X|--method)[\\s=]+DELETE\\b)"
+    # wrangler — its delete verbs are uniformly destructive (worker, kv key,
+    # r2 bucket/object, d1, pages project), so the key is exe + verb:
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*wrangler\\s+(?:[^\\s;&|]+\\s+)*?delete\\b"
+    # stripe CLI — resource deletion:
+    - command_pattern: "(?:^|[\\n;&|`]|\\$\\()\\s*(?:sudo\\s+(?:-\\w+\\s+)*)?(?:command\\s+)?(?:env\\s+)?(?:\\w+=\\S*\\s+)*stripe\\s+\\w[\\w-]*\\s+delete\\b"
+    # redis — one word erases every key in the store (ALLOSTAT_REDIS_URL is
+    # live infrastructure). Same class as DROP TABLE above:
+    - command_pattern: "\\b(?:FLUSHALL|FLUSHDB)\\b"
       case_sensitive: false
 response:
   action: hard_pause

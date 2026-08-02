@@ -32,8 +32,16 @@ response:
     Content preview: {preview}
 
     Sending content publicly or to others requires your explicit confirmation
-    each time. To proceed, confirm in chat:
-      "Yes, send {short_description}"
+    each time.
+
+    How to proceed:
+
+      Type `allostat: override` in your next message to authorize THIS
+      one send. Consent is single-use — the guard re-arms immediately
+      after, so every send gets its own confirmation.
+
+      (Legacy escape for non-interactive/bench use:
+      ALLOSTAT_INNATE_OVERRIDES=innate-09, or editing this rule file.)
 
     If you want to grant standing authorization for a specific channel
     (e.g., 'always allow drafts to my-list@example.com'), say so and I'll

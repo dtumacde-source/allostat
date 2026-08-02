@@ -26,10 +26,14 @@ response:
     copy is one of the top causes of lost work.
 
     To proceed, do ONE of:
-      1. Confirm in chat: "Edit {file_path}, this folder is canonical"
-         (I'll create CANONICAL.txt automatically)
+      1. Type `allostat: override` in your next message to authorize THIS
+         one edit and mark this folder canonical. Consent is single-use —
+         the guard re-arms immediately after.
       2. Tell me a different folder is canonical, I'll redirect there
       3. Verify against the live URL / live artifact via WebFetch first
+
+      (Legacy escape for non-interactive/bench use:
+      ALLOSTAT_INNATE_OVERRIDES=innate-04, or editing this rule file.)
 secondary_response_on_proceed:
   action: write_canonical_marker
   content: |

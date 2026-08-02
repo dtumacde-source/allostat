@@ -38,8 +38,16 @@ response:
     Effect: {what_changes_permanently}
 
     This action changes access / permissions / agreements / financial state
-    in ways that may be hard to reverse. To proceed, confirm in chat:
-      "Yes, {explicit_action}"
+    in ways that may be hard to reverse.
+
+    How to proceed:
+
+      Type `allostat: override` in your next message to authorize THIS
+      one action. Consent is single-use — the guard re-arms immediately
+      after, so every such action gets its own confirmation.
+
+      (Legacy escape for non-interactive/bench use:
+      ALLOSTAT_INNATE_OVERRIDES=innate-10, or editing this rule file.)
 
     Things I will NOT accept as authorization on your behalf:
       • Pre-checked agreement boxes

@@ -39,7 +39,14 @@ response:
     Files to archive: {file_list}
     Rename pattern: foo.html → foo_LEGACY_pre_{rollout_date}_rollout.html
 
-    Proceed? Type "yes" or specify exclusions.
+    How to proceed:
+
+      Type `allostat: override` in your next message to authorize THIS
+      one action, or tell me which files to exclude and I'll redirect.
+      Consent is single-use — the guard re-arms immediately after.
+
+      (Legacy escape for non-interactive/bench use:
+      ALLOSTAT_INNATE_OVERRIDES=innate-03, or editing this rule file.)
 edit_protection:
   pattern: "**/*_LEGACY_*"
   action: hard_pause

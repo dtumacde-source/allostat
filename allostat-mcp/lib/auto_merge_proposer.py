@@ -106,7 +106,8 @@ def find_merge_candidates(
     """Walk memory tree, compute TF-IDF signatures, return pairs whose
     top-term Jaccard overlap exceeds threshold.
 
-    Skips MEMORY.md/README.md + archive subdirs (_LEGACY/_PURGE/_RETIRED).
+    Skips MEMORY.md/README.md, archive subdirs (_LEGACY/_PURGE/_RETIRED), and
+    `handoffs/` (see AR-07 below).
     """
     if not memory_root.exists():
         return []
@@ -116,10 +117,24 @@ def find_merge_candidates(
     # `_RETIRED_old`), so an exact-name match let archived duplicates leak into
     # the merge corpus and get proposed for merging. `_processed` stays exact.
     skip_prefixes = ("_LEGACY", "_PURGE", "_RETIRED")
+    # AR-07 (2026-07-30): `handoffs` was never excluded, and the operator's
+    # queue had accumulated 820 proposals — exactly C(41,2), every possible
+    # pairing of 41 session handoffs. They pair with each other because they
+    # share the handoff TEMPLATE's boilerplate, not their content.
+    #
+    # This is a corpus error rather than a threshold error, so raising the
+    # threshold would not have been the fix. A handoff is a per-session
+    # continuity record: one file per session, keyed on session_id, addressed
+    # by that name by `handoff_discoverer` and `handoff_watchdog`. Merging two
+    # destroys the key they are addressed by, so no similarity score makes such
+    # a proposal correct.
+    #
+    # Matched on any path part so a relocated or nested memory tree is covered.
+    skip_exact = ("_processed", "handoffs")
     corpus: dict[str, Counter] = {}
     for p in memory_root.rglob("*.md"):
         if any(
-            part == "_processed" or part.startswith(skip_prefixes)
+            part in skip_exact or part.startswith(skip_prefixes)
             for part in p.parts
         ):
             continue
