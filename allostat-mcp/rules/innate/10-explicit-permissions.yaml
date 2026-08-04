@@ -1,15 +1,34 @@
 id: innate-10
-name: Never grant permissions or accept agreements without explicit chat confirmation
+name: >
+  Confirm before OAuth/SSO grants, agreement acceptance, payments, API-key
+  issuance, webhook registration, or account-security changes
 severity: lethal
 tier: innate
 description: >
-  Any action that grants access, accepts agreements, modifies security
-  permissions, completes financial transactions, or alters account settings
-  requires explicit chat confirmation. Implicit acceptance mechanisms,
-  pre-checked consent boxes, auto-acceptance timers, and "required to
-  continue" prompts are NOT valid authorizations. Each action gets its
-  own confirmation.
+  Each of these actions requires explicit chat confirmation, one at a time:
+  OAuth authorization and SSO completion; accepting terms, licences,
+  invitations, privacy policies, or cookie consent; granting a sharing
+  permission; issuing or rotating an API key; registering a webhook endpoint;
+  completing a Stripe charge or another payment; activating a subscription;
+  setting a password; setting up 2FA; and changing account settings. Implicit
+  acceptance mechanisms — pre-checked consent boxes, auto-acceptance timers,
+  and "required to continue" prompts — are NOT valid authorization for any of
+  them.
+
+  SCOPE, stated plainly (operator ruling, 2026-08-03): this rule covers the
+  shapes enumerated above and nothing wider. It does NOT claim to cover every
+  action that grants access. Permission-grant shapes across present and future
+  MCP tools are not enumerable, so a universal promise would be unkeepable by
+  construction — wrong by a margin nobody can measure, while the operator plans
+  around it. A narrower rule that blocks reliably is worth more than a broad one
+  that misses silently. Permission-shaped calls this rule does not recognize are
+  RECORDED (`permission_shape_unclassified`) rather than blocked, so the gaps
+  are visible and this list grows from real usage instead of guesswork.
 trigger:
+  # Every entry here must be a value `_classify_semantic_operation` can
+  # actually return (wrapper/hooks/pre-tool-use.py). `file_share_change` and
+  # `dashboard_access_modify` were listed until 2026-08-03 and no classifier
+  # branch could ever emit them — advertised coverage that could not fire.
   match_any:
     - operation: oauth_authorize
     - operation: sso_complete
@@ -17,8 +36,6 @@ trigger:
     - operation: privacy_policy_accept
     - operation: cookie_consent
     - operation: sharing_permission_grant
-    - operation: file_share_change
-    - operation: dashboard_access_modify
     - operation: api_key_grant
     - operation: webhook_endpoint_register
     - operation: stripe_charge
@@ -40,6 +57,9 @@ response:
     This action changes access / permissions / agreements / financial state
     in ways that may be hard to reverse.
 
+    (This guard recognizes a specific list of action shapes, not every
+    possible permission grant — see the rule's scope note.)
+
     How to proceed:
 
       Type `allostat: override` in your next message to authorize THIS
@@ -47,7 +67,10 @@ response:
       after, so every such action gets its own confirmation.
 
       (Legacy escape for non-interactive/bench use:
-      ALLOSTAT_INNATE_OVERRIDES=innate-10, or editing this rule file.)
+      ALLOSTAT_INNATE_OVERRIDES=innate-10. Editing this rule file is NOT
+      an escape: an edited rule fails its content pin and is DISABLED
+      entirely until the file is restored. Ask the agent how to disable a
+      guard instead.)
 
     Things I will NOT accept as authorization on your behalf:
       • Pre-checked agreement boxes

@@ -650,7 +650,52 @@ def format_loaded_notice(entry: HandoffEntry) -> str:
 
 
 def format_stale_pointer(entry: HandoffEntry) -> str:
-    """Calm past-the-freshness-gate pointer (advisor Q2): not silence, not the
-    nag. A handoff older than the inline dial isn't auto-loaded, but a quiet
-    line keeps the operator from losing a thread they forgot."""
-    return f'📋 Last handoff {entry.age_str} — say "resume" to load it.'
+    """Past-the-freshness-gate pointer, reshaped (D3, 2026-08-03).
+
+    The old line (`📋 Last handoff 1.7d ago — say "resume"...`) rendered the
+    same reassuring shape at 5 minutes and 41 hours: clipboard icon, calm
+    verb, the only variable datum parenthesized at the tail. An agent
+    reading it has no comparison to make, and the operator caught a 41-hour
+    gap only because he had context the line didn't carry. A status line
+    that looks identical whether the news is good or bad is decoration.
+
+    Past the dial the SHAPE changes: age leads, the glyph is a warning, and
+    "loaded" appears only in the negative — nothing stale can be skimmed as
+    a receipt. The fresh path (`format_loaded_notice`) is untouched; a
+    receipt is correct when the news is good.
+    """
+    return (
+        f"⚠️ {entry.age_str} since the last handoff — nothing was "
+        f'auto-loaded. Say "resume" to load {entry.filename}.'
+    )
+
+
+def format_degraded_resolution_notice(harness_dir: Path) -> str:
+    """D1 (2026-08-03): the session carried no working directory and the
+    transcript's harness folder could not be decoded to a real project, so
+    continuity is running against a HARNESS-SIDE tree — a parallel universe,
+    not the project's memory. Saying so beats presenting an orphan's stale
+    state as current fact (the ImagGen banner read a 5-week-old tree as
+    truth this way)."""
+    return (
+        f"⚠️ Continuity DEGRADED — this session carried no working "
+        f"directory, so memory resolved to a harness-side tree "
+        f"({harness_dir}). This is NOT your project's memory; nothing was "
+        f"auto-loaded, and handoffs written here will not reach the "
+        f"project. Start sessions from the project folder to restore "
+        f"continuity."
+    )
+
+
+def format_divergent_resolution_notice(
+    entry: HandoffEntry, canonical_dir: Path
+) -> str:
+    """D1 sentinel line: the newest handoff on disk is NOT in the canonical
+    tree this session writes to. That is a resolution bug, never an idle
+    project — the number must not be reported as plain fact."""
+    return (
+        f"⚠️ Continuity DIVERGENT — the newest handoff ({entry.age_str}) "
+        f"lives outside the canonical tree: {entry.path} vs "
+        f"{canonical_dir}. Reads and writes are split across two trees; "
+        f"run /allostat-fix."
+    )

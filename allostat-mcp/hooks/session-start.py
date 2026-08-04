@@ -327,13 +327,33 @@ def _handoff_inline_max_age_hours() -> float:
 def _resolve_handoff_continuity(
     project_root: Path | None,
     profile: HarnessProfile | None = None,
+    state_dir: Path | None = None,
+    provenance: str = "cwd",
 ) -> tuple[str | None, str | None]:
     """Proposal A — return (visible_notice, body_block) for THIS project's latest
     handoff.
 
       Fresh (≤ dial) → (loaded notice, injected body).
-      Stale (> dial) → (calm pointer, None).
+      Stale (> dial) → (age-first warning pointer, None).
       None found     → (None, None).
+
+    D1 (2026-08-03) adds two honesty rails, per the ruling (durable and
+    legible, never interruptive):
+
+      * `provenance == "harness_transcript_guess"` — the "project root" is a
+        harness directory standing in for an unknown project. Whatever
+        handoffs live there belong to a PARALLEL tree; auto-loading one as
+        the authoritative resume core is how a 2026-06-27 summary got
+        presented as current state. Degraded mode: a warning line that says
+        exactly that, NO body injection, one durable
+        `continuity_resolution_degraded` observation.
+      * Divergence sentinel — the selected newest handoff must live in the
+        canonical tree this session WRITES to. If it does not, and the
+        canonical tree's newest is older, reads and writes are split across
+        two trees: warn with both paths, record
+        `continuity_resolution_divergent`, and still inject the newest body
+        (it is the best continuity available — the LINE is what must not
+        reassure).
 
     Per-project latest (never a global handoff); excludes the `.detail.md`
     sibling. Best-effort — any failure returns (None, None) so continuity logic
@@ -349,6 +369,8 @@ def _resolve_handoff_continuity(
     try:
         from handoff_discoverer import (  # noqa: E402
             discover_handoffs,
+            format_degraded_resolution_notice,
+            format_divergent_resolution_notice,
             format_loaded_notice,
             format_resume_core_block,
             format_stale_pointer,
@@ -357,7 +379,31 @@ def _resolve_handoff_continuity(
     except ImportError:
         return (None, None)
     try:
-        # Wide discovery window (1y) so even an old handoff still surfaces a calm
+        if provenance == "harness_transcript_guess":
+            # F01: "undecodable" was only ever half the story. The decoder
+            # also returns None when the name decodes to SEVERAL existing
+            # paths — a collision it refuses to pick between. Both land here,
+            # so the recorded reason must cover both or the forensic trail
+            # says the wrong thing.
+            _degraded_reason = (
+                "no cwd in payload; transcript dir did not decode to a "
+                "unique existing path"
+            )
+            if state_dir is not None:
+                try:
+                    append_observation(
+                        state_dir, "continuity_resolution_degraded", details={
+                            "harness_dir": str(project_root),
+                            "reason": _degraded_reason,
+                        },
+                    )
+                except Exception:
+                    # Best-effort: the degraded NOTICE below is the load-bearing
+                    # half and does not depend on this record landing.
+                    pass
+            return (format_degraded_resolution_notice(project_root), None)
+
+        # Wide discovery window (1y) so even an old handoff still surfaces a
         # pointer rather than vanishing; the dial decides body-vs-pointer. The
         # advisor deferred an "ancient → nothing" tier, so none is added here.
         entries = discover_handoffs(
@@ -368,6 +414,42 @@ def _resolve_handoff_continuity(
         entry = select_latest_handoff(entries)
         if entry is None:
             return (None, None)
+
+        # Divergence sentinel: the newest handoff and the write target must
+        # be the same tree, or the stale number is a resolution bug being
+        # reported as fact.
+        try:
+            from session_handoff import resolve_canonical_handoff_dir  # noqa: E402
+            canonical = resolve_canonical_handoff_dir(project_root)
+            if entry.path.parent.resolve() != canonical.resolve():
+                canonical_newest = 0.0
+                if canonical.is_dir():
+                    canonical_newest = max(
+                        (p.stat().st_mtime for p in canonical.glob("*.md")),
+                        default=0.0,
+                    )
+                if entry.mtime > canonical_newest:
+                    if state_dir is not None:
+                        try:
+                            append_observation(
+                                state_dir,
+                                "continuity_resolution_divergent",
+                                details={
+                                    "newest_handoff": str(entry.path),
+                                    "canonical_dir": str(canonical),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    return (
+                        format_divergent_resolution_notice(entry, canonical),
+                        format_resume_core_block(entry)
+                        if entry.age_hours <= _handoff_inline_max_age_hours()
+                        else None,
+                    )
+        except Exception as e:
+            emit_stderr(f"divergence sentinel failed: {e}")
+
         if entry.age_hours <= _handoff_inline_max_age_hours():
             # Inject the LEAN resume core (bounded, survives the ~2KB inline cap),
             # not the full body. `profile` is retained for API/back-compat but the
@@ -834,6 +916,22 @@ def _root_project_memory(project_root, state_dir) -> None:
                                    details={"project_root": str(project_root)})
             except Exception:
                 pass
+        # D1 (2026-08-03): the STANDARD harness encoding gets its pointer
+        # above; stray encodings (bare project name, double-encoded harness
+        # path) carried nothing — which is how the ImagGen banner read a
+        # 5-week-old orphan as current state. Stamp every populated orphan
+        # with the same do-not-read-here pointer; content is never moved or
+        # deleted.
+        orphans = session_handoff.reconcile_orphan_harness_trees(project_root)
+        if state_dir is not None and orphans.get("stamped"):
+            try:
+                append_observation(state_dir, "orphan_memory_trees_stamped",
+                                   details={
+                                       "project_root": str(project_root),
+                                       "stamped": orphans["stamped"],
+                                   })
+            except Exception:
+                pass
     except Exception as e:
         emit_stderr(f"project-memory rooting failed: {e}")
 
@@ -976,7 +1074,13 @@ def _main() -> int:
     # produces a banner.
 
     payload = read_payload()
-    project_root = resolve_project_root_from_payload(payload)
+    # D1 (2026-08-03): carry the resolution's PROVENANCE. A no-cwd payload
+    # used to silently substitute the transcript's harness directory as
+    # "project root," and every downstream consumer — banner, memory
+    # injection, handoff write target — then operated on a parallel orphan
+    # universe with full confidence (the ImagGen 5-week-stale banner).
+    from _base import resolve_project_root_with_provenance  # noqa: E402
+    project_root, root_provenance = resolve_project_root_with_provenance(payload)
 
     state_dir: Path | None = None
     if project_root is not None:
@@ -1198,7 +1302,10 @@ def _main() -> int:
 
     # Proposal A — resolve this project's latest handoff once: the visible notice
     # rides the banner; the body injects separately (non-rendered) below.
-    handoff_notice, handoff_body = _resolve_handoff_continuity(project_root, profile=profile)
+    handoff_notice, handoff_body = _resolve_handoff_continuity(
+        project_root, profile=profile,
+        state_dir=state_dir, provenance=root_provenance,
+    )
 
     # F1 — cheap cached-count read of pending merge proposals (NO heavy
     # detection at session start; that's the Stop hook's job).

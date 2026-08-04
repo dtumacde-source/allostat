@@ -573,6 +573,50 @@ def _evaluate_lean_handoff_quality(state: WatchdogState, handoff_path: Path) -> 
         state.breadcrumb_nudge_pending = True
 
 
+def _credit_substantive_write(
+    state: WatchdogState,
+    handoff_path: Path,
+    mtime: float,
+    size: int,
+) -> None:
+    """Account for ONE substantive handoff write and re-arm the watchdog.
+
+    Every path that decides "the agent wrote a real handoff" must go through
+    here. Two of them exist (the is_fresh branch and the wrote-since-last-
+    reminder gate) and the second-cycle defect was one of them doing four of
+    the five required updates.
+
+    The load-bearing line is the LAST one. `last_reminder_handoff_mtime` is
+    the gate's baseline, and before 2026-08-03 its only setter lived inside
+    the reminder-queue branch — so neither reset path advanced it. Once any
+    handoff newer than the last reminder existed, `mtime > baseline` stayed
+    true for the remainder of the session: every later breach took the reset
+    path, re-credited the SAME write, and never nagged. D2 closed the first
+    fire; this closes the one after it. Field shape it produced: 662k-token
+    sessions with 15 credited writes and zero reminders.
+
+    Advancing the baseline to the mtime just credited makes the gate mean
+    what its name says — "a write happened since the last reminder AND has
+    not already been counted" — so a stale handoff escalates on the next
+    breach while a genuine response-write still resets (the drift case the
+    gate exists for).
+    """
+    prior_escalation = state.escalation_level
+    state.last_handoff_mtime = mtime
+    state.last_handoff_path = str(handoff_path)
+    state.last_handoff_size = size
+    state.turns_since_last_write = 0
+    state.tokens_at_last_write = state.last_seen_cumulative_tokens
+    state.escalation_level = 0
+    state.reminder_pending = False
+    state.stops_since_last_max_level_queue = 0
+    state.session_handoff_count += 1
+    if prior_escalation > 0:
+        state.session_response_count += 1
+    # Consume the credit: this write can never be counted a second time.
+    state.last_reminder_handoff_mtime = mtime
+
+
 def check_and_set_reminder_state(
     state_dir: Path,
     project_root: Path,
@@ -656,17 +700,7 @@ def check_and_set_reminder_state(
                     pass
             if passes_check:
                 # Real handoff — reset counters, decrement escalation.
-                prior_escalation = state.escalation_level
-                state.last_handoff_mtime = mtime
-                state.last_handoff_path = str(handoff_path)
-                state.last_handoff_size = size
-                state.turns_since_last_write = 0
-                state.tokens_at_last_write = state.last_seen_cumulative_tokens
-                state.escalation_level = 0
-                state.reminder_pending = False
-                state.session_handoff_count += 1
-                if prior_escalation > 0:
-                    state.session_response_count += 1
+                _credit_substantive_write(state, handoff_path, mtime, size)
                 result["action"] = "handoff_written_substantive"
                 result["escalation_level"] = 0
                 _evaluate_lean_handoff_quality(state, handoff_path)
@@ -711,23 +745,26 @@ def check_and_set_reminder_state(
             # handoff has been written/updated since the LAST reminder fired,
             # the protocol is being followed: reset instead of re-nagging.
             # Firing is now "handoff stale since last fire", not "N turns".
+            # D2 (2026-08-03): `session_reminder_count > 0` is the whole fix.
+            # The mtime baseline defaults to 0.0 and its ONLY setter is
+            # inside the escalate branch this gate guards — so any session
+            # with an existing valid handoff satisfied `mtime > 0.0` on
+            # every threshold crossing: full reset, session_handoff_count
+            # += 1 (the phantom 65), and never a reminder. Measured: 2 fires
+            # in 499 sessions. Drift protection has nothing to protect
+            # before the first reminder has fired — and the fired-yet signal
+            # must be the REMINDER COUNT, not the baseline itself: a
+            # reminder fired before any handoff existed legitimately leaves
+            # the baseline at 0.0, and the response-write that follows must
+            # still be recognized (test_handoff_written_since_reminder_
+            # halts_escalation pins that case).
             if (
                 handoff_exists
+                and state.session_reminder_count > 0
                 and mtime > state.last_reminder_handoff_mtime
                 and _passes_anti_pattern_check(handoff_path)
             ):
-                prior_escalation = state.escalation_level
-                state.last_handoff_mtime = mtime
-                state.last_handoff_path = str(handoff_path)
-                state.last_handoff_size = size
-                state.turns_since_last_write = 0
-                state.tokens_at_last_write = state.last_seen_cumulative_tokens
-                state.escalation_level = 0
-                state.reminder_pending = False
-                state.stops_since_last_max_level_queue = 0
-                state.session_handoff_count += 1
-                if prior_escalation > 0:
-                    state.session_response_count += 1
+                _credit_substantive_write(state, handoff_path, mtime, size)
                 result["action"] = "handoff_fresh_since_last_reminder"
                 result["escalation_level"] = 0
                 _evaluate_lean_handoff_quality(state, handoff_path)

@@ -48,6 +48,238 @@ except Exception as _redact_import_err:  # pragma: no cover — broken install
     emit_stderr(f"secret_redaction unavailable, logging unredacted: {_redact_import_err}")
 
 
+# C02 (2026-08-03) — the semantic-operation classifier for rules 09/10.
+#
+# The rules speak `gmail_send` / `stripe_charge` / `oauth_authorize`; the
+# pipeline spoke only `write`/`edit`/`read`. Two vocabularies, one parameter
+# name, no adapter — so two lethal rules were certified enforceable and could
+# never fire (audit C02). This classifier is the adapter: it normalizes an
+# app/MCP tool call into the rules' fixed operation vocabulary BEFORE
+# execution, wrapper-local, so the lethal decision is an in-line exit code
+# and never a raced advisory (PATCH-143).
+#
+# Design rules, in order of precedence (full evidence base and every
+# judgment call: audits/20260803_send_and_permission_operation_inventory.md):
+#
+#   1. Read-shaped names never classify. `list`/`get`/`search`/... return
+#      None immediately — rule 09's own text says reading inboxes is fine,
+#      and an over-firing guard on mail tooling gets the product disabled.
+#   2. Composing is not sending. `create_draft`/`update_draft`/`compose-*`
+#      stay None; only a send-shaped verb classifies.
+#   3. Unknown stays unknown. A name this table cannot read returns None —
+#      `_match_operation_entry` treats None as no-fire (strict, like
+#      match_all). The guard covers named semantic operations; guessing
+#      would fire two lethal rules on every novel tool.
+#   4. Annotations live here, not in the matcher. `platforms` evidence is
+#      how a name reaches `post_to_social`; rule 09's
+#      `check: payload_is_communication` is why the webhook branch demands
+#      a content-bearing argument before classifying.
+
+_SEMANTIC_READ_VERBS = frozenset({
+    "get", "list", "search", "read", "fetch", "retrieve", "describe",
+    "show", "preview", "view", "query", "count", "download", "status",
+    "history", "export", "suggest", "resolve",
+})
+
+_SOCIAL_PLATFORM_TOKENS = frozenset({
+    # innate-09's platforms annotation, as name evidence.
+    "twitter", "x", "reddit", "linkedin", "facebook", "instagram",
+    "threads", "mastodon", "bluesky", "social",
+})
+
+_MAIL_TOKENS = frozenset({"email", "emails", "mail", "gmail", "outlook", "smtp"})
+
+_COMMS_PAYLOAD_KEYS = frozenset({
+    "payload", "body", "data", "text", "message", "content", "html", "json",
+})
+
+
+def _semantic_tool_tokens(tool_name: str | None) -> set[str]:
+    """Lowercased word tokens of the tool segment of an MCP/app tool name.
+
+    `mcp__<server>__<tool>` keeps only `<tool>` — server aliases are
+    user-configured and carry no stable meaning; Codex-style bare names
+    (`gmail_send_email`) pass through whole.
+    """
+    tail = (tool_name or "").rsplit("__", 1)[-1].lower()
+    return {t for t in re.split(r"[^a-z0-9]+", tail) if t}
+
+
+# F02 (2026-08-03) — vocabulary for "this call looks like it grants something,
+# and rule 10 did not recognize it." NOT an enforcement list: nothing here
+# blocks. The operator ruled that innate-10 advertises only the shapes it
+# actually catches, which leaves a real question — WHICH shapes are we missing?
+# Answering it by guessing is how the universal-coverage claim happened in the
+# first place. These tokens make an unrecognized permission-shaped call leave a
+# durable trace, so the gap list writes itself from real usage and stays
+# visible instead of being silently allowed.
+_PERMISSION_SHAPE_TOKENS = frozenset({
+    "permission", "permissions", "grant", "grants", "access", "role", "roles",
+    "collaborator", "collaborators", "member", "members", "membership",
+    "invite", "invitation", "share", "sharing", "consent", "authorize",
+    "authorization", "oauth", "sso", "credential", "credentials", "scope",
+    "scopes", "privilege", "privileges", "admin", "owner", "ownership",
+    "payment", "charge", "billing", "subscription", "payout", "transfer",
+})
+
+
+def _looks_permission_shaped(tool_name: str | None) -> bool:
+    """True when a call carries permission/money vocabulary. Advisory only —
+    the caller RECORDS, never refuses. Read-shaped calls are excluded so
+    `list_permissions` and `get_roles` do not generate noise."""
+    tokens = _semantic_tool_tokens(tool_name)
+    if not tokens or tokens & _SEMANTIC_READ_VERBS:
+        return False
+    return bool(tokens & _PERMISSION_SHAPE_TOKENS)
+
+
+def _record_unclassified_permission_shape(state_dir, tool_name: str | None) -> None:
+    """One durable observation per DISTINCT unrecognized permission-shaped
+    tool name. Deduped with the same atomic O_CREAT|O_EXCL claim the rule-drop
+    announcer uses — the hook is a fresh process per tool call, so in-memory
+    state cannot dedup. Per tool name rather than per session: the point is the
+    SET of shapes worth adding, and a shape seen a thousand times is still one
+    entry on that list.
+
+    Never raises past its caller's guard: bookkeeping must not affect whether
+    a tool call proceeds.
+    """
+    if state_dir is None or not tool_name:
+        return
+    if not _looks_permission_shaped(tool_name):
+        return
+    import hashlib  # noqa: E402
+    import os  # noqa: E402
+
+    digest = hashlib.sha256(tool_name.encode("utf-8")).hexdigest()[:16]
+    claim = Path(state_dir) / f"permission_shape_seen_{digest}"
+    try:
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        return  # this shape is already on the list
+    except OSError:
+        pass  # cannot claim (odd fs): record anyway — twice beats never
+    from local_state import append_observation  # noqa: E402
+    append_observation(state_dir, "permission_shape_unclassified", details={
+        "tool_name": tool_name[:200],
+        "tokens": sorted(_semantic_tool_tokens(tool_name) & _PERMISSION_SHAPE_TOKENS),
+        "note": "allowed, not blocked — innate-10 does not recognize this shape",
+    })
+
+
+def _classify_semantic_operation(tool_name: str | None, payload: dict) -> str | None:
+    """Map an app/MCP tool call to rules 09/10's operation vocabulary.
+
+    Returns one of the rules' fixed `operation:` values, or None when the
+    call is read-shaped, draft-shaped, or unrecognized. Never raises: a
+    classifier crash must not become either a refusal or a bypass — the
+    caller wraps it, and None is the fail-quiet direction the strict
+    matcher expects.
+    """
+    tokens = _semantic_tool_tokens(tool_name)
+    if not tokens:
+        return None
+    if tokens & _SEMANTIC_READ_VERBS:
+        return None
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    arg_keys = (
+        {str(k).lower() for k in tool_input}
+        if isinstance(tool_input, dict) else set()
+    )
+
+    # --- rule 09: content leaving the machine as communication -----------
+    if "draft" in tokens and "send" not in tokens:
+        return None  # composing is not sending
+    if "send" in tokens:
+        if "gmail" in tokens:
+            return "gmail_send"
+        if "outlook" in tokens:
+            return "outlook_send"
+        if "smtp" in tokens:
+            return "smtp_send"
+        if tokens & {"batch", "bulk", "mass"} and tokens & _MAIL_TOKENS:
+            return "mass_email"
+        if "broadcast" in tokens:
+            return "broadcast_message"
+        if "webhook" in tokens:
+            # check: payload_is_communication — enforced HERE, per rule 09.
+            if arg_keys & _COMMS_PAYLOAD_KEYS:
+                return "webhook_send_with_payload"
+            return None
+        if tokens & _MAIL_TOKENS:
+            return "smtp_send"
+        if tokens & {"message", "messages", "dm", "chat", "sms"}:
+            return "broadcast_message"
+        # Bare `send` with no communication noun (send_event, send_signal,
+        # send_keys): genuinely ambiguous — None, per the inventory.
+        return None
+    if tokens & {"tweet", "toot"}:
+        return "post_to_social"
+    if "publish" in tokens:
+        # Before the `post` branch: `publish_post` must land here, and a
+        # bare `post` without publish evidence stays in the narrower branch.
+        if "template" in tokens:
+            return None  # publish-template: product-internal, not public content
+        return "publish_blog_post"
+    if "post" in tokens:
+        if tokens & _SOCIAL_PLATFORM_TOKENS:
+            return "post_to_social"
+        if tokens & {"forum", "discourse", "topic", "thread"}:
+            return "post_to_forum"
+        if tokens & {"blog", "article"}:
+            return "publish_blog_post"
+        if tokens & {"message", "chat"}:
+            return "broadcast_message"  # chat_post_message shapes
+        return None
+
+    # --- rule 10: grants, agreements, money, account controls ------------
+    if tokens & {"oauth", "authorize"}:
+        return "oauth_authorize"
+    if "sso" in tokens:
+        return "sso_complete"
+    if tokens & {"accept", "agree", "consent"}:
+        if tokens & {"privacy"}:
+            return "privacy_policy_accept"
+        if tokens & {"cookie", "cookies"}:
+            return "cookie_consent"
+        if tokens & {"terms", "tos", "agreement", "license", "invite",
+                     "invitation"}:
+            return "terms_of_service_accept"
+        return None  # accept_suggestion and friends stay unclassified
+    if tokens & {"share", "sharing", "permission", "permissions"} and tokens & {
+        "add", "create", "grant", "set", "update", "change", "modify",
+    }:
+        return "sharing_permission_grant"
+    if "api" in tokens and tokens & {"key", "keys"} and tokens & {
+        "create", "grant", "issue", "generate", "rotate",
+    }:
+        return "api_key_grant"
+    if "webhook" in tokens and tokens & {"create", "register", "add"}:
+        return "webhook_endpoint_register"
+    if tokens & {"charge", "payment", "purchase", "order"}:
+        if "stripe" in tokens:
+            return "stripe_charge"
+        if tokens & {"complete", "create", "confirm", "capture", "execute",
+                     "process", "submit", "place"}:
+            return "payment_complete"
+        return None
+    if "subscription" in tokens and tokens & {"create", "activate", "start",
+                                              "resume"}:
+        return "subscription_activate"
+    if "password" in tokens and tokens & {"set", "change", "reset", "update"}:
+        return "password_set"
+    if tokens & {"2fa", "mfa", "totp"} and tokens & {"setup", "enable",
+                                                     "register", "add",
+                                                     "create"}:
+        return "2fa_setup"
+    if tokens & {"account", "profile"} and tokens & {"setting", "settings"} \
+            and tokens & {"update", "change", "set", "modify"}:
+        return "account_setting_change"
+    return None
+
+
 def _extract_tool_attributes(payload: dict) -> tuple[str, str | None, str | None]:
     """Return (tool_name, command, file_path) from the PreToolUse payload."""
     tool_name = payload.get("tool_name") or payload.get("toolName") or ""
@@ -245,6 +477,115 @@ def _innate_evaluator_failed(command, exc):
         "continuing.",
         hook_event="PreToolUse",
     )
+
+
+def _announce_innate_rule_drops(state_dir, session_id: str | None = None) -> None:
+    """One durable `innate_rule_dropped` observation per SESSION per DISTINCT
+    degradation (M01, 2026-08-03 — reviewer and advisor ruled identically).
+
+    The working-set gate (innate_rules._build_working_set) is right to drop an
+    edited rule — content that no longer matches its pin must not be enforced.
+    What it may not do is drop QUIETLY: before this, the only trace on an
+    allowed call was a logger.warning in a subprocess nobody reads, and the
+    loud path (session-start banner) cannot fire until the next restart.
+
+    Identity is (session, content): the digest covers the sorted (id, reason)
+    pairs — and since the hash-mismatch reason now embeds the OBSERVED content
+    hash, two different edits to the same rule are two different degradations.
+    A new session re-records an ongoing degradation (the forever-marker's
+    silence was the finding); the same degradation within one session records
+    once (observations.jsonl already met one every-tool-call flooder — the
+    2026-07-30 cut removed it, and this must not reintroduce the shape).
+
+    Dedup is ATOMIC across processes: each (session, digest) pair claims an
+    O_CREAT|O_EXCL marker file — first creator announces, everyone else
+    returns. No read-then-write window (the old single-marker scheme could
+    double-append on parallel first calls). The legacy
+    `innate_dropped_announced.json` marker is IGNORED but never deleted —
+    operator state; one extra announcement on upgrade beats a lost one.
+    Claim files are tiny and bounded (one per degradation per session).
+
+    Never raises past its caller's guard: enforcement must not depend on
+    bookkeeping.
+    """
+    if state_dir is None:
+        return
+    from innate_rules import dropped_rules  # noqa: E402
+    drops = dropped_rules()
+    if not drops:
+        return
+    import hashlib  # noqa: E402
+    import json  # noqa: E402 — this hook has no module-level json import
+    import os  # noqa: E402
+
+    content = json.dumps(sorted((d["id"], d["reason"]) for d in drops))
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    sess_key = hashlib.sha256(
+        (session_id or "nosession").encode("utf-8")
+    ).hexdigest()[:12]
+    claim = Path(state_dir) / f"innate_drop_claim_{digest}_{sess_key}"
+    try:
+        # Parent first: on the very first tool call the state dir may not
+        # exist yet, and a FileNotFoundError here would skip the claim and
+        # double-announce on the next call (caught by 0B.4's repeat test).
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        return  # this (session, degradation) already announced — atomically
+    except OSError:
+        pass  # cannot claim (odd fs): announce anyway — twice beats never
+    from local_state import append_observation  # noqa: E402
+    append_observation(state_dir, "innate_rule_dropped", details={
+        "rules": [d["id"] for d in drops],
+        "reasons": {d["id"]: d["reason"] for d in drops},
+        "count": len(drops),
+        "session": (session_id or "")[:64],
+    })
+
+
+def _record_ruleset_degradation(state_dir, kind: str, exc: BaseException) -> None:
+    """One durable `innate_ruleset_degraded` observation per DISTINCT
+    evaluator/import failure. C01 (2026-08-03).
+
+    The two `except` arms around the innate evaluator route to
+    `_innate_evaluator_failed`, which correctly refuses destructive-looking
+    commands on last-resort patterns and ALLOWS everything else — but the
+    allowed path used to leave no durable trace at all: stderr only, in a
+    subprocess nobody reads. A session could run start to finish with the
+    whole evaluator down and the record would show nothing.
+
+    Same shape as `_announce_innate_rule_drops`: durable and legible, never
+    interruptive (the advisor's 2026-08-03 ruling) — this function reports
+    the degradation, it never converts it into a refusal, and it never
+    raises past its caller. Dedup is content-keyed on (kind, error class,
+    error text) so a DIFFERENT failure later in the session still records.
+    """
+    if state_dir is None:
+        return
+    try:
+        import hashlib  # noqa: E402
+        import json  # noqa: E402
+
+        content = json.dumps([kind, type(exc).__name__, str(exc)[:200]])
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        marker = Path(state_dir) / "innate_ruleset_degraded_announced.json"
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")).get("digest") == digest:
+                return
+        except (OSError, ValueError):
+            pass  # absent or unreadable marker: announce — twice beats never
+        from local_state import append_observation  # noqa: E402
+        append_observation(state_dir, "innate_ruleset_degraded", details={
+            "kind": kind,
+            "error_class": type(exc).__name__,
+            "error": str(exc)[:500],
+            "destructive_fallback": "armed (last-resort patterns)",
+        })
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"digest": digest}), encoding="utf-8")
+    except Exception as record_err:  # noqa: BLE001
+        emit_stderr(f"innate degradation record failed: {record_err}")
 
 
 def _bash_sandbox_policy_active() -> bool:
@@ -2457,6 +2798,24 @@ def _main() -> int:
             "notebookread": "read",
         }
         _operation = _op_map.get((tool_name or "").lower())
+        # C02 (2026-08-03): tools outside the file map get the semantic
+        # classifier — the adapter between app/MCP tool names and rules
+        # 09/10's operation vocabulary. Crash-armored: a classifier failure
+        # degrades to None (strict no-fire), never to a refusal or a crash.
+        if _operation is None:
+            try:
+                _operation = _classify_semantic_operation(tool_name, payload)
+            except Exception as e:  # noqa: BLE001
+                emit_stderr(f"semantic operation classifier failed: {e}")
+                _operation = None
+            # F02: still unrecognized, and it looked like a grant. Do not
+            # refuse what cannot be classified — but do not be silent about
+            # it either. Bookkeeping only; never changes the outcome.
+            if _operation is None:
+                try:
+                    _record_unclassified_permission_shape(state_dir, tool_name)
+                except Exception as e:  # noqa: BLE001
+                    emit_stderr(f"permission-shape recorder failed: {e}")
         innate_match = match_pre_tool_call(
             tool_name=tool_name,
             command=command,
@@ -2467,6 +2826,26 @@ def _main() -> int:
             context_flags=set(context_flags),
             sibling_list=sibling_list,
         )
+        # 2026-08-02 — a dropped rule must not be a silent rule. The gate in
+        # _build_working_set removes any edited/duplicate/unknown rule with
+        # one logger.warning nothing renders on ALLOWED calls, and the loud
+        # banner runs at session START only — so a mid-session drop guards
+        # nothing and tells no one until the next restart. Measured the same
+        # day: the server ran 11 of 12 rules and only CI said so. This writes
+        # ONE durable observation per distinct degradation (cross-process
+        # dedup via a state-dir marker; the hook is a fresh process per tool
+        # call, so in-memory state cannot dedup).
+        #
+        # Its own try/except, NOT the enclosing one: the enclosing handlers
+        # route to _innate_evaluator_failed, which refuses destructive-looking
+        # commands — an announcement bug must never convert into refusals.
+        try:
+            _announce_innate_rule_drops(
+                state_dir,
+                payload.get("session_id") or payload.get("sessionId"),
+            )
+        except Exception as announce_err:  # noqa: BLE001
+            emit_stderr(f"innate drop announcement failed: {announce_err}")
         if innate_match is not None:
             # PATCH-175 (2026-05-22): override branch. Operator set
             # ALLOSTAT_INNATE_OVERRIDES to suspend this rule for the session.
@@ -2545,6 +2924,9 @@ def _main() -> int:
                     )
     except ImportError as e:
         emit_stderr(f"innate_rules import failed: {e}")
+        # C01: the record lands FIRST, so both the allowed fall-through and
+        # the refusal below leave the same durable trace.
+        _record_ruleset_degradation(state_dir, "import_failure", e)
         _degraded = _innate_evaluator_failed(command, e)
         if _degraded is not None:
             return _degraded
@@ -2553,6 +2935,7 @@ def _main() -> int:
         # NOT a bare fall-through. See _innate_evaluator_failed: a raise here
         # used to disarm all twelve rules silently, and the raise is reachable
         # from one crafted rules file.
+        _record_ruleset_degradation(state_dir, "evaluator_exception", e)
         _degraded = _innate_evaluator_failed(command, e)
         if _degraded is not None:
             return _degraded
@@ -3106,6 +3489,22 @@ def _main() -> int:
             emit_stderr(f"apply_writes failed: {e}")
 
     text = response.get("additional_context") or ""
+    if text and _pending_override is not None:
+        # A consent token cleared a refusal for exactly this command. The
+        # server dispatch evaluated the same command independently and its
+        # advisory box (frequently the SAME rule's) arrives here — rendering
+        # it is the reproduced-twice "cleared refusal still shows its red
+        # box" defect, and for a while the box shown was also the stale
+        # server-side text, which is how anyone noticed. PATCH-175 already
+        # named the principle for the env-var path: the operator knows they
+        # are overriding; the block message is noise. Scope: THIS call only —
+        # the env-var override deliberately keeps server chrome (a session-
+        # wide override should keep showing what would have fired), and
+        # ordinary calls keep the dispatch surface verbatim.
+        emit_stderr(
+            "server advisory context suppressed for this consent-cleared call"
+        )
+        text = ""
     if text:
         try:
             emit_additional_context(text, hook_event="PreToolUse")

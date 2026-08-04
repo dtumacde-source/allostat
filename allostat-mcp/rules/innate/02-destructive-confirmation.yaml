@@ -40,7 +40,26 @@ trigger:
     - command_pattern: "git\\s+push\\s+[^|;&]*\\s\\+\\S"
     - command_pattern: "git\\s+branch\\s+-D"
     - command_pattern: "git\\s+clean\\s+-(f|x)"
-    - command_pattern: "git\\s+checkout\\s+(--|\\.)"
+    # checkout, split in two (2026-08-02). The single entry here used to be
+    # `git\s+checkout\s+(--|\.)`, whose `--` alternative had no boundary. It
+    # therefore matched the leading `--` of EVERY long flag — `--detach`,
+    # `--track`, `--orphan` — none of which discard anything, while `-f`, the
+    # short spelling of the one flag that DOES throw away uncommitted work,
+    # matched nothing at all. The guard was refusing the safe forms and
+    # waving the destructive one through.
+    #
+    # This is NOT the round-10 quoted-prose boundary that
+    # test_legacy_patterns_still_overconfirm pins; that boundary is untouched
+    # and these two entries stay unanchored in the same way. The trade round
+    # 10 accepted was over-confirmation, never under-confirmation, so closing
+    # `-f` is what that record actually asks for.
+    #
+    # 1. the pathspec separator (`git checkout -- <path>`) and `git checkout .`
+    #    — both discard working-tree changes.
+    - command_pattern: "git\\s+checkout\\s+(--(\\s|$)|\\.)"
+    # 2. force in either spelling, anywhere in the command, since `git checkout
+    #    <branch> -f` is as destructive as `-f <branch>`.
+    - command_pattern: "git\\s+checkout(?=[^\\n;&|]*\\s(?:--force|-f)\\b)"
     - command_pattern: "git\\s+restore\\s+\\."
     - command_pattern: "DROP\\s+TABLE"
       case_sensitive: false
@@ -187,8 +206,11 @@ response:
       one command. Consent is single-use — the guard re-arms immediately
       after, so every destructive command gets its own confirmation.
 
-      (Legacy escapes still exist for non-interactive/bench use:
-      ALLOSTAT_INNATE_OVERRIDES env var, or editing this rule file.)
+      (Legacy escape for non-interactive/bench use: the
+      ALLOSTAT_INNATE_OVERRIDES env var. Editing this rule file is NOT an
+      escape: an edited rule fails its content pin and is DISABLED entirely
+      — destructive coverage drops to a last-resort pattern set — until the
+      file is restored. Ask the agent how to disable a guard instead.)
 
     The override is logged to .allostat/observations.jsonl as
     innate_rule_overridden — forensics preserved regardless of which

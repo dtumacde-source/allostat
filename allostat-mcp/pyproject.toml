@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "allostat-mcp"
-version = "1.4.78"
+version = "1.4.79"
 description = "Hosted-MCP wrapper for Allostat (Claude Code plugin)"
 authors = [{ name = "Dominick Tumacder" }]
 maintainers = [{ name = "Health Professions Data LLC", email = "support@allostat.ai" }]

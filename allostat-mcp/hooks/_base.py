@@ -196,26 +196,187 @@ def read_payload() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def resolve_project_root_from_payload(payload: dict[str, Any]) -> Path | None:
-    """Use the harness-provided transcript path / cwd to pick a project
-    root. Falls back to cwd."""
+# F01 (2026-08-03) — cap on directory entries examined while enumerating
+# decode candidates. Real paths finish in a few hundred; the cap bounds a
+# pathological tree. Exhausting it means uniqueness could not be PROVEN,
+# which is treated exactly like ambiguity: degrade, never guess.
+_DECODE_PROBE_BUDGET = 50_000
+
+
+def _decode_harness_dir_name(name: str) -> Path | None:
+    """Decode a harness project-directory name back to the real path it
+    encodes — accepted only when that path is the UNIQUE inverse
+    (D1 2026-08-03; uniqueness added for F01, same date).
+
+    The sanitizer (`session_handoff.sanitize_cwd_for_harness`) maps ':', '\\',
+    '/', and ' ' all to '-', so the encoding is lossy AND many-to-one:
+    `C--dev-a-b` is the image of `C:\\dev\\a\\b`, `C:\\dev\\a-b`, and
+    `C:\\dev\\a b` alike.
+
+    A round-trip (`sanitize(decoded) == name`) proves a candidate is *a*
+    valid inverse. It does NOT prove it is the *only* one — that was F01:
+    the walk returned its first longest match, round-tripped it, and handed
+    back `decoded_harness_transcript` provenance for what was really a coin
+    flip between sibling projects. A resuming session could then be given
+    another project's memory and instructed to trust it.
+
+    So: enumerate every existing candidate, and return one only when there
+    is exactly one. Two or more (or an unprovable search, see
+    `_DECODE_PROBE_BUDGET`) returns None, and the caller degrades to
+    `harness_transcript_guess` — which refuses to inject a resume core as
+    authoritative. A declared guess is recoverable; a confident wrong answer
+    is not. Enumeration stops as soon as a second match appears: the caller
+    only needs "exactly one or not", never the full list.
+
+    Candidates come from READING THE DIRECTORY, not from re-joining tokens
+    with '-'. That distinction is load-bearing. A token-joining walk can
+    only ever synthesize names containing '-', so it is structurally blind
+    to `alpha beta` — it would find `alpha-beta`, see a single match, and
+    report a unique decode while a real collider sat next to it on disk.
+    Listing each directory and sanitizing the names actually present finds
+    every collider regardless of which character collapsed.
+    """
+    import re
+
+    m = re.match(r"^([A-Za-z])--(.+)$", name)
+    if m:
+        root = Path(f"{m.group(1)}:\\")
+        rest = m.group(2)
+    elif name.startswith("-") and len(name) > 1:
+        root = Path("/")
+        rest = name[1:]
+    else:
+        return None  # bare names (`ImagGen`) encode nothing recoverable
+    # Case folding follows the FILESYSTEM, via os.path.normcase: a no-op on
+    # POSIX (where `Alpha` and `alpha` are genuinely different directories and
+    # folding would invent collisions), lowercase on Windows/macOS. A cwd
+    # string does not always carry the on-disk casing — `c:\dev\allostat`
+    # typed at a prompt encodes with a lowercase drive while the directory is
+    # `C:\dev\allostat` — so an exact byte compare against real directory
+    # names silently refuses paths that plainly exist (measured: this rejected
+    # `C--Windows-system32`, whose directory is `System32`). Where casing
+    # cannot distinguish two directories, folding cannot manufacture a
+    # collision either.
+    folded_name = os.path.normcase(name)
+    tokens = [t for t in os.path.normcase(rest).split("-")]
+    if not tokens or len(tokens) > 32:
+        return None
+
+    from session_handoff import sanitize_cwd_for_harness  # noqa: E402
+
+    matches: list[Path] = []
+    probes = 0
+    exhausted = False
+
+    def _walk(base: Path, idx: int) -> None:
+        nonlocal probes, exhausted
+        if len(matches) > 1 or exhausted:
+            return
+        if idx == len(tokens):
+            # A complete consumption of the tokens. It counts only if
+            # re-sanitizing reproduces the name (modulo filesystem casing).
+            if os.path.normcase(sanitize_cwd_for_harness(base)) == folded_name:
+                matches.append(base)
+            return
+        remaining = len(tokens) - idx
+        try:
+            with os.scandir(base) as entries:
+                for entry in entries:
+                    if len(matches) > 1 or exhausted:
+                        return
+                    if probes >= _DECODE_PROBE_BUDGET:
+                        exhausted = True
+                        return
+                    probes += 1
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        # Best-effort: an entry that cannot be stat'd (vanished
+                        # mid-scan, permission denied) contributes no candidate.
+                        # Skipping can only ever shrink the match set, so it can
+                        # hide a collider and cause a DEGRADE — never a wrong
+                        # confident answer, which is the direction that matters.
+                        continue
+                    # How many tokens would this real directory name have
+                    # produced? Whatever collapsed inside it — a space, a
+                    # literal dash — sanitizing reproduces the encoder's own
+                    # output for this component.
+                    child_tokens = os.path.normcase(
+                        sanitize_cwd_for_harness(entry.name)
+                    ).split("-")
+                    if len(child_tokens) > remaining:
+                        continue
+                    if tokens[idx:idx + len(child_tokens)] != child_tokens:
+                        continue
+                    _walk(Path(entry.path), idx + len(child_tokens))
+        except OSError:
+            # Unreadable directory (permissions, vanished): it contributes
+            # no candidates. Uniqueness among the readable ones still holds
+            # for the tree we can see.
+            return
+
+    try:
+        _walk(root, 0)
+    except RecursionError:
+        return None
+    if exhausted:
+        return None  # uniqueness unproven — same answer as ambiguous
+    if len(matches) == 1:
+        return matches[0]
+    return None  # zero candidates, or a collision: never adopt a guess
+
+
+def resolve_project_root_with_provenance(
+    payload: dict[str, Any],
+) -> tuple[Path | None, str]:
+    """Resolve the project root AND say how it was resolved (D1, 2026-08-03).
+
+    Provenance values:
+      "cwd"                       — the payload said so; authoritative.
+      "decoded_harness_transcript"— no cwd, but the transcript's harness
+                                    directory name decoded to a real path and
+                                    round-tripped exactly; equally authoritative.
+      "harness_transcript_guess"  — no cwd, undecodable transcript dir; the
+                                    harness directory itself stands in. Memory
+                                    resolved from this is a PARALLEL tree, not
+                                    the project's — callers must say so rather
+                                    than present its contents as current state
+                                    (the ImagGen banner read a 5-week-old
+                                    orphan as fact this way).
+      "cwd_fallback"              — no payload hints at all; Path.cwd().
+
+    The un-provenanced `resolve_project_root_from_payload` below delegates
+    here, so the two can never diverge.
+    """
     cwd_hint = payload.get("cwd") or payload.get("workspaceRoot")
     if cwd_hint:
         try:
-            return Path(cwd_hint).resolve()
+            return Path(cwd_hint).resolve(), "cwd"
         except Exception:
             pass
     transcript = payload.get("transcript_path") or payload.get("transcriptPath")
     if transcript:
         try:
             tp = Path(transcript)
-            # The transcript folder lives at .claude/projects/<encoded>/.
-            # Fall back to that as a project_root proxy when no .allostat/.
             if tp.parent.exists():
-                return tp.parent
+                decoded = _decode_harness_dir_name(tp.parent.name)
+                if decoded is not None:
+                    return decoded, "decoded_harness_transcript"
+                # The transcript folder lives at .claude/projects/<encoded>/.
+                # Fall back to that as a project_root proxy when no .allostat/.
+                return tp.parent, "harness_transcript_guess"
         except Exception:
             pass
-    return Path.cwd()
+    return Path.cwd(), "cwd_fallback"
+
+
+def resolve_project_root_from_payload(payload: dict[str, Any]) -> Path | None:
+    """Use the harness-provided transcript path / cwd to pick a project
+    root. Falls back to cwd. Provenance-free view of
+    `resolve_project_root_with_provenance` — same resolution, always."""
+    root, _provenance = resolve_project_root_with_provenance(payload)
+    return root
 
 
 _pending_codex_context: list[str] = []

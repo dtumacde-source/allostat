@@ -514,23 +514,123 @@ def regenerate_harness_pointer(project_root: Path) -> dict:
         if not harness.is_dir():
             result["skipped_reason"] = "no_harness_tree"
             return result
-        harness_index = harness / "MEMORY.md"
-        pointer = _harness_pointer_text(in_project)
-        if harness_index.is_file():
-            existing = harness_index.read_text(encoding="utf-8", errors="replace")
-            if existing == pointer:
-                result["skipped_reason"] = "already_pointer"
-                return result
-            # Archive the ORIGINAL real index once, before the first overwrite.
-            if _HARNESS_POINTER_MARKER not in existing:
-                backup = harness / "MEMORY.md.PRE_POINTER"
-                if not backup.exists():
-                    import shutil
-                    shutil.copy2(harness_index, backup)
-        harness_index.write_text(pointer, encoding="utf-8")
-        result["regenerated"] = True
+        wrote, skip = _write_pointer_into(harness, in_project)
+        if wrote:
+            result["regenerated"] = True
+        else:
+            result["skipped_reason"] = skip
     except OSError as e:
         result["skipped_reason"] = f"oserror:{e}"
+    return result
+
+
+def _write_pointer_into(
+    harness_memory_dir: Path, in_project: Path
+) -> tuple[bool, str | None]:
+    """Write/refresh the do-not-read-here pointer MEMORY.md inside ONE
+    harness-side memory dir. Extracted verbatim from
+    `regenerate_harness_pointer` (D1, 2026-08-03) so the orphan reconciler
+    below shares the exact archival semantics: the original real index is
+    archived ONCE (`MEMORY.md.PRE_POINTER`) before the first overwrite —
+    never destroyed. Returns (wrote, skipped_reason)."""
+    harness_index = harness_memory_dir / "MEMORY.md"
+    pointer = _harness_pointer_text(in_project)
+    if harness_index.is_file():
+        existing = harness_index.read_text(encoding="utf-8", errors="replace")
+        if existing == pointer:
+            return False, "already_pointer"
+        # Archive the ORIGINAL real index once, before the first overwrite.
+        if _HARNESS_POINTER_MARKER not in existing:
+            backup = harness_memory_dir / "MEMORY.md.PRE_POINTER"
+            if not backup.exists():
+                import shutil
+                shutil.copy2(harness_index, backup)
+    harness_index.write_text(pointer, encoding="utf-8")
+    return True, None
+
+
+def orphan_harness_candidates(project_root: Path) -> list[Path]:
+    """Every `~/.claude/projects/<name>/memory` a stray encoding of THIS
+    project could have created (D1, 2026-08-03). Three observed shapes:
+
+      1. sanitized cwd            — `C--dev-ImagGen` (the standard tree;
+                                    the migration already tends it)
+      2. bare project name        — `ImagGen` (a caller handed a NAME or
+                                    the harness filed a no-cwd session there)
+      3. double-encoded harness   — `C--Users-<user>--claude-projects-ImagGen`
+                                    (something sanitized the harness path
+                                    itself)
+
+    Returns existing candidate memory dirs, standard encoding excluded (the
+    ordinary migration owns it). Read-only; the reconciler decides writes.
+    """
+    project_root = Path(project_root)
+    projects = Path.home() / ".claude" / "projects"
+    standard = sanitize_cwd_for_harness(project_root)
+    names = {
+        project_root.name,                                   # bare
+        sanitize_cwd_for_harness(projects / standard),       # double-encoded
+    }
+    out: list[Path] = []
+    for name in sorted(names):
+        if not name or name == standard:
+            continue
+        candidate = projects / name / "memory"
+        try:
+            if candidate.is_dir():
+                out.append(candidate)
+        except OSError:
+            # Best-effort: an unstatable candidate simply isn't an orphan we
+            # can tend; enumeration must never break session start.
+            continue
+    return out
+
+
+def reconcile_orphan_harness_trees(project_root: Path) -> dict:
+    """Stamp the do-not-read-here pointer into every populated ORPHAN
+    harness tree for this project (D1, 2026-08-03).
+
+    The ImagGen incident: a no-cwd session resolved memory into the bare
+    `projects/ImagGen` tree; the banner then read that orphan and presented
+    a 5-week-old handoff as current state while the live project tree was
+    11 minutes old. The standard-encoding tree already carries the pointer
+    (`regenerate_harness_pointer`); the stray encodings carried nothing.
+
+    Same gate as the ordinary pointer: acts only when memory is genuinely
+    project-rooted with a non-empty index. Content is never moved or
+    deleted — the pointer marks, the archival keeps. Best-effort per tree;
+    never raises.
+    """
+    result: dict = {"stamped": [], "skipped": []}
+    project_root = Path(project_root)
+    if _is_harness_path(project_root):
+        result["skipped"].append(("*", "project_root_is_harness_path"))
+        return result
+    in_project = project_root / "memory"
+    try:
+        index_ok = (
+            resolve_memory_root(project_root) == in_project
+            and (in_project / "MEMORY.md").is_file()
+            and (in_project / "MEMORY.md")
+            .read_text(encoding="utf-8-sig", errors="replace").strip() != ""
+        )
+    except OSError:
+        index_ok = False
+    if not index_ok:
+        result["skipped"].append(("*", "not_project_rooted"))
+        return result
+    for candidate in orphan_harness_candidates(project_root):
+        try:
+            if not _tree_has_memory(candidate):
+                result["skipped"].append((str(candidate), "empty"))
+                continue
+            wrote, skip = _write_pointer_into(candidate, in_project)
+            if wrote:
+                result["stamped"].append(str(candidate))
+            else:
+                result["skipped"].append((str(candidate), skip))
+        except OSError as e:
+            result["skipped"].append((str(candidate), f"oserror:{e}"))
     return result
 
 

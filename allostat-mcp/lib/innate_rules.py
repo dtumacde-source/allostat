@@ -187,9 +187,20 @@ def _load_rules_from_json(rules_dir: Path) -> list[dict[str, Any]]:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            # C01 (2026-08-03): captured per-file, not just skipped — the
+            # expected-minus-seen diff in _build_working_set names the id
+            # this file would have supplied and needs the reason.
+            _LOAD_FAILURES.append({
+                "file": path.name,
+                "problem": f"could not be parsed ({type(exc).__name__})",
+            })
             continue
         if not isinstance(data, dict):
+            _LOAD_FAILURES.append({
+                "file": path.name,
+                "problem": "parsed but is not a mapping",
+            })
             continue
         if "id" not in data:
             data["id"] = path.stem
@@ -206,6 +217,11 @@ def _load_rules_from_yaml(rules_dir: Path) -> list[dict[str, Any]]:
     except ImportError:
         logger.warning("PyYAML not available; innate rules cannot load")
         _LOAD_DIAGNOSTICS.set("PyYAML is not installed, so no rule file can be parsed")
+        # C01: loader-wide condition — answers for every expected id below.
+        _LOAD_FAILURES.append({
+            "file": "*",
+            "problem": "PyYAML is not installed, so no rule file can be parsed",
+        })
         return []
 
     rules: list[dict[str, Any]] = []
@@ -219,10 +235,18 @@ def _load_rules_from_yaml(rules_dir: Path) -> list[dict[str, Any]]:
             # destructive guard could vanish without anything saying so.
             logger.warning("innate rule %s could not be loaded: %s", path.name, exc)
             _LOAD_DIAGNOSTICS.set(f"{path.name} could not be parsed ({type(exc).__name__})")
+            _LOAD_FAILURES.append({
+                "file": path.name,
+                "problem": f"could not be parsed ({type(exc).__name__})",
+            })
             continue
         if not isinstance(data, dict):
             logger.warning("innate rule %s is not a mapping; skipped", path.name)
             _LOAD_DIAGNOSTICS.set(f"{path.name} is not a YAML mapping")
+            _LOAD_FAILURES.append({
+                "file": path.name,
+                "problem": "is not a YAML mapping",
+            })
             continue
         if "id" not in data:
             data["id"] = path.stem
@@ -410,19 +434,25 @@ EXPECTED_INNATE_RULE_HASHES: dict[str, str] = {
     # 01/03/04/09/10 stopped printing exact-phrase remedies no code reads, and
     # 11/12 dropped the dead `exception_phrase_template` key. See
     # tests/test_innate_advertised_remedy_is_real.py for the invariant.
-    "innate-01": "99e40948c6ee006a95f977cdfb805ecf8c3cadb2448097043f9369e7fcd28f27",
+    "innate-01": "f2a2f3fcd621ffed746c46176e3b7998800034e470cf9ceaadf9e36670740e1d",
     # 2026-08-01: re-pinned for the destructive-operation registry (advisor
     # H-03) — find -delete/shred/dd/truncate, interleaved-flag git deletes,
     # and named aws/gh/wrangler/stripe/redis destructive operations.
-    "innate-02": "8749a19897af0fc411804872b5d3304f364514a34eea812e6bc602b7dee2333b",
-    "innate-03": "a5ae9415e2028c82ef8ce99f7d0b3592c42fa9d2a78b07efc57ebea0a25b857f",
-    "innate-04": "6b1ad53aa0f192f57942b477697f91ddc1d34329ad512a5008d5582626af0dba",
+    "innate-02": "6f7ee4aee1f4c31ecdc69469973e97ec9912f9c9f1e26889547ab798dc501e7d",
+    "innate-03": "8d134930bbe0fccf2cec078ce0f554bb8bf9792a3bd2aa81cf3cdaaafbb0c68b",
+    "innate-04": "3a8a63f4aa0971870144ecb682d43d89b033a5dcab72e866ff94c1ce41234dcb",
     "innate-05": "d657f3473e30bb2c37c01697d087cd0c8d34c0587ff3f4baba15296b07725afd",
     "innate-06": "c4f114cf62742061e333b63292cd7327e20eac5b597cf930c120ef9a735009d9",
     "innate-07": "793488571903147d9b951bab5aa61705cb74265076681454103ce75a77e58c50",
     "innate-08": "bee935b1b2eb8f27b958c4b970bb6e7441dce7c39a7f7ddfc287cea1c70d6d76",
-    "innate-09": "03c090b52c7dd5d623c4aa3cf911f7d2fb276901352c15d943581dfce870460f",
-    "innate-10": "b53f1292938104a95312feb9b06352852570934b885a4383ce0523b2a74887d1",
+    "innate-09": "d1019aabc400476e873a366f2a6263e2b3ff73f2cbfa481f2d774279d03e7d00",
+    # 2026-08-03: re-pinned for F02 — innate-10's name/description narrowed to
+    # the shapes the classifier actually recognizes (operator ruling: narrow
+    # the promise rather than chase universal coverage), and two trigger
+    # operations removed that no classifier branch could ever emit
+    # (file_share_change, dashboard_access_modify). Deliberate constitution
+    # change; mirrored server-side in the same commit.
+    "innate-10": "d521f12634fd80c97769c6662b9f8b2b36d5b6c275dec136ffa19b9c96c93110",
     "innate-11": "87f750f50d575bd8b5fe6feb8223d83c4c0c953dcf35da25d1929115ad30d2d9",
     "innate-12": "e27b1a2a71b4a7915ac79cda6d20bde6be0b7f2e39c6077fc2930889a9b5c563",
 }
@@ -860,34 +890,58 @@ def _build_working_set(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     stricter validate_destructive_rule bar on top of the general one.
     """
     by_id: dict[str, dict[str, Any]] = {}
+    # Rebuilt on every working-set build: this list is "what the gate removed
+    # THIS time", not an append-only history. `_LOAD_DIAGNOSTICS` keeps only
+    # the LAST reason, which is how a 12-rule set could lose several rules and
+    # report one; announcement needs every drop, per rule, with its reason
+    # (2026-08-02 — the server ran 11 of 12 and nothing said so until CI).
+    _DROPPED_RULES.clear()
+
+    def _record_drop(rule_id: Any, reason: str) -> None:
+        logger.warning("innate rule rejected: %s", reason)
+        _LOAD_DIAGNOSTICS.set(reason)
+        _DROPPED_RULES.append({"id": str(rule_id), "reason": reason})
+
     for rule in rules:
         if not isinstance(rule, dict):
             continue
         rid = rule.get("id")
         if rid not in EXPECTED_INNATE_RULE_IDS:
-            reason = f"{rid!r} is not in the innate manifest; rule dropped"
-            logger.warning("innate rule rejected: %s", reason)
-            _LOAD_DIAGNOSTICS.set(reason)
+            _record_drop(rid, f"{rid!r} is not in the innate manifest; rule dropped")
             continue
-        if _rule_content_hash(rule) != EXPECTED_INNATE_RULE_HASHES.get(rid):
-            reason = (f"{rid} does not match its pinned content hash "
-                      "(edited or replaced); rule dropped")
-            logger.warning("innate rule rejected: %s", reason)
-            _LOAD_DIAGNOSTICS.set(reason)
+        observed_hash = _rule_content_hash(rule)
+        if observed_hash != EXPECTED_INNATE_RULE_HASHES.get(rid):
+            # M01 (2026-08-03): the OBSERVED hash is part of the reason, so
+            # two different edits to the same rule are two different
+            # degradations — the announcement digest keys on reasons, and a
+            # generic reason made every edit of one rule the same event.
+            _record_drop(rid, (f"{rid} does not match its pinned content hash "
+                               f"(edited or replaced; observed "
+                               f"{observed_hash[:12]}); rule dropped"))
             continue
         if validate_innate_rule(rule):
-            reason = (f"{rid} failed validation and was dropped from the "
-                      "working set: " + "; ".join(validate_innate_rule(rule)))
-            logger.warning("innate rule rejected: %s", reason)
-            _LOAD_DIAGNOSTICS.set(reason)
+            _record_drop(rid, (f"{rid} failed validation and was dropped from the "
+                               "working set: " + "; ".join(validate_innate_rule(rule))))
             continue
         if rid == DESTRUCTIVE_RULE_ID and validate_destructive_rule(rule):
-            reason = (f"{DESTRUCTIVE_RULE_ID} loaded but is not enforceable: "
-                      + "; ".join(validate_destructive_rule(rule)))
-            logger.warning("innate rule rejected: %s", reason)
-            _LOAD_DIAGNOSTICS.set(reason)
+            _record_drop(rid, (f"{DESTRUCTIVE_RULE_ID} loaded but is not enforceable: "
+                               + "; ".join(validate_destructive_rule(rule))))
             continue
         by_id.setdefault(rid, rule)   # survivors of one id are byte-identical
+    # C01 (2026-08-03): the loop above can only drop what PARSED AND ARRIVED.
+    # A rule file that is missing, unreadable, or not a mapping never appears
+    # in `rules`, so the gate never saw it and nothing recorded it — the
+    # reviewer moved one rule file out of the glob and the real hook exited 0
+    # with zero durable records. Expected-minus-seen is the only construction
+    # that can see an ABSENCE rather than a rejection; loader-captured
+    # per-file failures supply the reason when one exists.
+    seen_ids = {str(r.get("id")) for r in rules if isinstance(r, dict)}
+    for rid in sorted(set(EXPECTED_INNATE_RULE_IDS) - seen_ids):
+        _record_drop(
+            rid,
+            f"{rid} never reached the working-set gate: "
+            + _loader_diagnostic_for(rid),
+        )
     # Preserve the canonical first-match order: manifest order is rule 01..12.
     return [by_id[rid] for rid in sorted(by_id)]
 
@@ -997,6 +1051,64 @@ class _LoadDiagnostics:
 
 _LOAD_DIAGNOSTICS = _LoadDiagnostics()
 
+# Every rule the manifest-identity gate removed in the most recent
+# working-set build — id + reason, one entry per drop. Deliberately richer
+# than _LOAD_DIAGNOSTICS (last reason only): announcement has to name each
+# missing rule, and "several dropped, one reported" is itself a silence.
+_DROPPED_RULES: list[dict[str, str]] = []
+
+
+def dropped_rules() -> list[dict[str, str]]:
+    """Rules the manifest-identity gate dropped when the working set was
+    built: `[{"id": ..., "reason": ...}, ...]`, empty when the set is whole.
+
+    C01 (2026-08-03): includes expected ids that never ARRIVED at the gate —
+    missing, unreadable, or non-mapping rule files, and the rules-directory-
+    lost / PyYAML-absent conditions — not only rules the gate rejected. An
+    absence and a rejection are both degradations; only one of them used to
+    leave a record.
+
+    Forces the build (same trigger as matching) so a caller asking before
+    any match still gets the truth. Returns copies — the module state is
+    not a mutation surface.
+    """
+    _get_rules()
+    return [dict(d) for d in _DROPPED_RULES]
+
+
+# C01 (2026-08-03): per-file loader failures, captured where they happen so
+# the expected-minus-seen diff in _build_working_set can attach a REASON to
+# an id that never arrived. `file` is the rule file's name, or "*" for a
+# loader-wide condition (PyYAML absent, rules directory missing) that
+# answers for every id without a per-file failure of its own. Reset by
+# `_get_raw_rules` at each fresh load, alongside the raw cache it describes.
+_LOAD_FAILURES: list[dict[str, str]] = []
+
+
+def _loader_diagnostic_for(rule_id: str) -> str:
+    """Best known loader failure for an expected id that never arrived at
+    the working-set gate; the missing-file default otherwise.
+
+    Filename prefix maps the id: shipped rule files are `NN-<slug>.*` and
+    expected ids are `innate-NN`, so `innate-09` claims failures recorded
+    against `09-*` files. Wildcard entries (file == "*") are loader-wide
+    conditions and answer for every id that has no per-file failure.
+
+    Mirrored verbatim server-side (pillars/innate_enforcer.py) — lockstep
+    tier (test_pillar_wrapper_server_drift_parity).
+    """
+    prefix = rule_id.rsplit("-", 1)[-1] + "-"
+    problems = [
+        f["problem"] for f in _LOAD_FAILURES if f["file"].startswith(prefix)
+    ]
+    if problems:
+        return "; ".join(problems)
+    wide = [f["problem"] for f in _LOAD_FAILURES if f["file"] == "*"]
+    if wide:
+        return "; ".join(wide)
+    return ("no rule file on disk claims this id (file missing, renamed, or "
+            "unreadable)")
+
 
 def _get_raw_rules() -> list[dict[str, Any]]:
     """Return every rule that PARSED, before the manifest-identity gate.
@@ -1009,9 +1121,15 @@ def _get_raw_rules() -> list[dict[str, Any]]:
     """
     global _RAW_RULES_CACHE
     if _RAW_RULES_CACHE is None:
+        # C01: the failures list describes THIS load — reset with the cache.
+        _LOAD_FAILURES.clear()
         rules_dir = _bundled_rules_dir()
         if not rules_dir:
             _LOAD_DIAGNOSTICS.set("no bundled rules directory was found")
+            _LOAD_FAILURES.append({
+                "file": "*",
+                "problem": "no bundled rules directory was found",
+            })
         _RAW_RULES_CACHE = _load_rules(rules_dir) if rules_dir else []
     return _RAW_RULES_CACHE
 
@@ -1208,6 +1326,48 @@ def _match_command_pattern(entry: dict, command: str) -> bool:
         return bool(re.search(pat, command, flags=flags))
     except re.error:
         return False
+
+
+def _match_operation_entry(entry: dict, operation: str | None) -> bool:
+    """Check a PURE `operation:` match_any entry against the call's
+    classified operation (C02, 2026-08-03).
+
+    Rules 09/10 are written entirely in bare `operation:` entries
+    (`gmail_send`, `stripe_charge`, `oauth_authorize`, ...). Until this
+    helper existed no matcher consumed them — the schema declared the key
+    usable, the loop checked only command/file patterns, and two lethal
+    rules were documentation (audit C02; a Gmail-send and a Stripe-payment
+    payload both cleared the real hook with exit 0).
+
+    Scope is deliberately narrow: an entry that ALSO carries another usable
+    matcher key belongs to that matcher — an operation-GATED file_pattern
+    entry (rules 01/03) keeps `_match_file_pattern`'s bypass-when-
+    unclassified semantics, and signal entries stay on the dispatch
+    surface. Annotation keys (`platforms`, `check`) refine the CLASSIFIER's
+    vocabulary rather than this equality test: the classifier only emits
+    `webhook_send_with_payload` when the arguments actually carry a
+    communication payload, and platform evidence is part of how a tool
+    name classifies to `post_to_social` at all (see
+    _classify_semantic_operation in hooks/pre-tool-use.py and
+    audits/20260803_send_and_permission_operation_inventory.md).
+
+    `operation=None` (unclassifiable call) does NOT fire — same strictness
+    as `_match_all_satisfied`. This family guards NAMED semantic
+    operations; treating unknown as matching would fire two lethal rules
+    on every unclassified tool call.
+
+    Mirrored verbatim server-side (pillars/innate_enforcer.py) — lockstep
+    tier (test_pillar_wrapper_server_drift_parity).
+    """
+    required = entry.get("operation")
+    if not required or not operation:
+        return False
+    if any(
+        k in entry
+        for k in ("command_pattern", "file_pattern", "signal", "phrase", "context")
+    ):
+        return False
+    return _operation_matches(required, operation)
 
 
 def _operation_matches(required_op: Any, operation: str | None) -> bool:
@@ -1518,6 +1678,12 @@ def match_pre_tool_call(
                 if _match_file_pattern(entry, file_path or "", operation):
                     matched = True
                     break
+                # C02 (2026-08-03): pure `operation:` entries — rules
+                # 09/10's send/grant/payment vocabulary, previously consumed
+                # by no matcher anywhere.
+                if _match_operation_entry(entry, operation):
+                    matched = True
+                    break
 
         # match_all family
         if not matched:
@@ -1740,6 +1906,11 @@ def _format_match(
         filename=filename,
         tool_name=tool_name or "",
         operation=operation or "",
+        # C02 (2026-08-03): rules 09/10's templates say {operation_type} —
+        # render the classified operation there rather than a literal
+        # placeholder. Synced with server _check_pre_tool_call_response
+        # (PATCH-160 tier).
+        operation_type=operation or "(unclassified operation)",
         sibling_list=sibling_rendered,
         today_date=today_str,
     )
