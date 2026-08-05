@@ -1,7 +1,7 @@
 """Handoff watchdog — wrapper-side enforcement layer for the A3 protocol.
 
 A3 (2026-05-24) Fix Now memory-architecture refactor: Claude authors
-rolling handoffs to `~/.claude/projects/<cwd>/memory/handoffs/<session_id>.md`
+rolling handoffs to the project-rooted path `resolve_memory_root()` returns
 per the protocol shipped in `data/appendix_seed/claude_handoff_protocol.md`.
 The watchdog ensures Claude doesn't silently drift off-protocol.
 
@@ -823,7 +823,7 @@ def check_and_set_reminder_state(
 _REMINDER_LEVEL_1 = """\
 [Allostat handoff watchdog — protocol reminder]
 
-Your rolling handoff at `~/.claude/projects/<cwd>/memory/handoffs/<session_id>.md`
+Your rolling handoff at `{handoff_path}`
 is overdue per the MCS protocol. Write or update it now before continuing.
 
 Cadence reminder: every 3-5 turns of substantive work, plus metabolism pulses
@@ -837,7 +837,7 @@ You've drifted past the rolling-handoff threshold a second time. The watchdog
 escalated to level 2.
 
 WRITE THE HANDOFF NOW at:
-  `~/.claude/projects/<cwd>/memory/handoffs/<session_id>.md`
+  `{handoff_path}`
 
 Use the structure from `claude_handoff_protocol.md`:
 - ## Focus
@@ -856,7 +856,7 @@ _REMINDER_LEVEL_3 = """\
 
 Watchdog has fired three times without a substantive handoff write. Filling
 the stub below and writing it counts as the handoff. Edit as needed, then
-write to `~/.claude/projects/<cwd>/memory/handoffs/<session_id>.md` BEFORE
+write to `{handoff_path}` BEFORE
 your response to the operator.
 
 ```markdown
@@ -917,22 +917,41 @@ Soft nudge — fix it on your next handoff write.
 """
 
 
-def _select_reminder_text(escalation_level: int) -> str:
+#: Used when a legacy caller supplies no resolved path. It must NOT be a
+#: cwd-derived harness pattern: naming `~/.claude/projects/<cwd>/...` is what
+#: sent handoffs into the harness tree on 2026-08-04. Pointing at the hook's
+#: own surfaced value is always correct and never contradicts it.
+_UNKNOWN_HANDOFF_PATH = "the exact handoff path the SessionStart hook surfaced"
+
+
+def _select_reminder_text(escalation_level: int, handoff_path=None) -> str:
     """Pick reminder text for current escalation level. Returns empty
-    string for level 0 (no reminder)."""
+    string for level 0 (no reminder).
+
+    `handoff_path` is substituted into the template so the reminder names the
+    SAME destination SessionStart already computed. Substitution is a literal
+    replace rather than str.format() because the level-3 stub contains markdown
+    braces that format() would try to interpret.
+    """
     if escalation_level <= 0:
         return ""
     if escalation_level == 1:
-        return _REMINDER_LEVEL_1
-    if escalation_level == 2:
-        return _REMINDER_LEVEL_2
-    return _REMINDER_LEVEL_3
+        text = _REMINDER_LEVEL_1
+    elif escalation_level == 2:
+        text = _REMINDER_LEVEL_2
+    else:
+        text = _REMINDER_LEVEL_3
+    return text.replace(
+        "{handoff_path}",
+        str(handoff_path) if handoff_path else _UNKNOWN_HANDOFF_PATH,
+    )
 
 
 def consume_reminder_if_due(
     state_dir: Path,
     session_id: str = "",
     cumulative_tokens: Optional[int] = None,
+    handoff_path: Optional[Path] = None,
 ) -> str:
     """Called from UserPromptSubmit hook. Returns reminder text to inject
     via additionalContext, or empty string.
@@ -966,7 +985,7 @@ def consume_reminder_if_due(
 
     reminder_text = ""
     if state.reminder_pending and state.escalation_level > 0:
-        reminder_text = _select_reminder_text(state.escalation_level)
+        reminder_text = _select_reminder_text(state.escalation_level, handoff_path)
         state.reminder_pending = False  # consumed; next Stop may re-fire if still overdue
     elif state.breadcrumb_nudge_pending:
         # Orphan-detail risk outranks mild bloat. One-shot.

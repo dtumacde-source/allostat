@@ -11,7 +11,7 @@ You author the rolling session handoff. Cadence: every 3–5 substantive turns +
 
 ## Claude rolling handoff protocol (MCS)
 
-You author session handoffs. The wrapper doesn't anymore — its auto-render lives at `~/.claude/projects/<cwd>/.allostat/audit/` for behavioral observability, separate from continuity. The memory tree's `handoffs/` folder belongs to you.
+You author session handoffs. The wrapper doesn't anymore — its auto-render lives at `<project_root>/.allostat/audit/` for behavioral observability, separate from continuity. The memory tree's `handoffs/` folder belongs to you.
 
 ### Write location
 
@@ -32,9 +32,16 @@ target). One file per session, keyed on YOUR sessionId from the session-start
 payload (`session_id` field), overwrite in place.
 
 **Fallback ONLY if the marker is absent:** use `<your_session_id>.md` (NOT a
-timestamp, NOT a prior session's id) under `~/.claude/projects/<cwd>/memory/handoffs/`,
-sanitizing `<cwd>` by replacing `:` `\` `/` and spaces with `-`. Always prefer
-the marker over the fallback when both are available.
+timestamp, NOT a prior session's id) under `<project_root>/memory/handoffs/` —
+the memory tree that travels with the project. Always prefer the marker over the
+fallback when both are available.
+
+**Never write a handoff under `~/.claude/`.** That path is the harness's own
+namespace, not a project folder, even when it contains something that looks like
+one. On 2026-08-04 this fallback named it and handoffs for a live project landed
+there; the operator moved them by hand. If you cannot determine the project root,
+say so and write nothing rather than writing into the harness tree — a stated
+gap is recoverable, a handoff nobody can find is not.
 
 ### Cadence (no operator signal required)
 

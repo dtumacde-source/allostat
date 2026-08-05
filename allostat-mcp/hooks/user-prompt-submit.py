@@ -393,12 +393,25 @@ def _main() -> int:
     # appropriate transcript reader (codex rollout telemetry vs Claude usage).
     try:
         import handoff_watchdog  # noqa: E402
+        import session_handoff  # noqa: E402
         _cum_tokens_for_watchdog = _resolve_cumulative_tokens(
             payload, harness=profile.name,
         )
         _wd_session_id = payload.get("session_id") or payload.get("sessionId") or ""
+        # Hand the watchdog the SAME destination SessionStart surfaced. Without
+        # it the reminder named a cwd-derived harness path and a session got two
+        # different destinations in one run (2026-08-04) — handoffs landed under
+        # ~/.claude/projects/ and the operator moved them by hand.
+        try:
+            _wd_handoff_path = (
+                session_handoff.resolve_memory_root(project_root)
+                / "handoffs" / f"{_wd_session_id}.md"
+            ) if _wd_session_id else None
+        except Exception:
+            _wd_handoff_path = None
         watchdog_reminder = handoff_watchdog.consume_reminder_if_due(
             state_dir, _wd_session_id, cumulative_tokens=_cum_tokens_for_watchdog,
+            handoff_path=_wd_handoff_path,
         )
         if watchdog_reminder:
             try:

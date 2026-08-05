@@ -583,6 +583,25 @@ def _build_banner(
     """
     lines: list[str] = []
 
+    # Project opened INSIDE `~/.claude/projects/` (2026-08-04). A functional
+    # cue by the strictest reading of this banner's scope: memory and handoffs
+    # are landing somewhere that does not travel with the project, and if the
+    # project also exists elsewhere the two trees are diverging silently. The
+    # operator hit exactly this and had to move handoffs by hand. Detection
+    # already existed in resolve_memory_root's neighbourhood; the reporting
+    # path is what was missing, so it is wired here rather than left as a
+    # function nothing calls.
+    if project_root is not None:
+        try:
+            import session_handoff  # noqa: E402
+            _ns_warning = session_handoff.harness_namespace_project_warning(
+                project_root
+            )
+            if _ns_warning:
+                lines.append(_ns_warning)
+        except Exception as e:
+            emit_stderr(f"harness-namespace check failed: {e}")
+
     # Genuine auth-stale (401) — subscription_gate saw HTTP 401 on its most
     # recent /user/state poll. KEPT (real error, not status chrome): a
     # silently-rejected bearer means zero server-side state writes this session.
