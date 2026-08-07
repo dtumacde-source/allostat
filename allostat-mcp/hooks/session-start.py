@@ -1297,7 +1297,7 @@ def _main() -> int:
             import update_check  # noqa: E402
             status = update_check.evaluate(state_dir, plugin_root)
             if status is not None:
-                notice_line = update_check.format_banner_line(status)
+                notice_line = update_check.format_banner_line(status, harness=detect_harness())
         except Exception as e:
             emit_stderr(f"update_check evaluate failed: {e}")
 

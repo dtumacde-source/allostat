@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -199,11 +200,63 @@ def evaluate(
         return None
 
 
-def format_banner_line(status: UpdateStatus | None) -> str | None:
+def format_banner_line(
+    status: UpdateStatus | None,
+    harness: str | None = None,
+    *,
+    windows: bool | None = None,
+    mac: bool | None = None,
+) -> str | None:
+    """One line naming the update command that actually works on THIS harness.
+
+    Until 2026-08-04 this said "Re-run the installer to upgrade" to everyone. A
+    Codex customer typically no longer has install.py on disk, so the notice
+    named an action they could not take; a Claude Code customer was never told
+    the one-word command they do have.
+
+    The Codex branch also used to emit PowerShell (`irm ... -OutFile`) for every
+    OS, which is not a command macOS/Linux can run at all. `windows` selects
+    which OS-specific fetch command to show; None (the default) resolves to
+    `os.name == "nt"` at call time -- same pattern as
+    codex_wiring._codex_command_token's `windows_shell`. The production call
+    site (session-start.py) never passes it, so resolution always happens on
+    the customer's own machine.
+    """
     if not status or not status.update_available:
         return None
     installed = status.installed or "your version"
-    return (
-        f"ℹ Allostat update available: v{installed} → v{status.latest}. "
-        "Re-run the installer to upgrade."
-    )
+    head = f"ℹ Allostat update available: v{installed} → v{status.latest}."
+    if harness == "claude":
+        # M02 (2026-08-06 swarm): `/allostat update` is Windows-only — its own
+        # doc says so (wrapper/commands/allostat.md) — yet this branch told
+        # every Claude customer to run it. macOS/Linux get the code-free
+        # installer refresh (the same recovery repair-install.sh routes to; it
+        # reuses the saved bearer and never consumes an install code). `mac`
+        # mirrors `windows`: None resolves on the customer's machine at call
+        # time, and the production call site passes neither.
+        on_windows = windows if windows is not None else (os.name == "nt")
+        if on_windows:
+            return f"{head} Run `/allostat update`."
+        on_mac = mac if mac is not None else (sys.platform == "darwin")
+        script = "install/mac/install.sh" if on_mac else "install/linux/install.sh"
+        return (
+            f"{head} Update with:\n"
+            f"   curl -fsSL https://installer.allostat.ai/{script} | bash -s -- --refresh\n"
+            "   Then fully quit and reopen Claude Code to load the new version."
+        )
+    if harness == "codex":
+        on_windows = windows if windows is not None else (os.name == "nt")
+        if on_windows:
+            return (
+                f"{head} Update with:\n"
+                "   irm https://installer.allostat.ai/install/codex/install.py -OutFile install.py\n"
+                "   python install.py --refresh\n"
+                "   Then restart Codex and re-trust the hooks via /hooks."
+            )
+        return (
+            f"{head} Update with:\n"
+            "   curl -fsSL https://installer.allostat.ai/install/codex/install.py -o install.py\n"
+            "   python3 install.py --refresh\n"
+            "   Then restart Codex and re-trust the hooks via /hooks."
+        )
+    return f"{head} Re-run the Allostat installer to upgrade."

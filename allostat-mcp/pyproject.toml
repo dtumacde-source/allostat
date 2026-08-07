@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "allostat-mcp"
-version = "1.4.81"
+version = "1.4.85"
 description = "Hosted-MCP wrapper for Allostat (Claude Code plugin)"
 authors = [{ name = "Dominick Tumacder" }]
 maintainers = [{ name = "Health Professions Data LLC", email = "support@allostat.ai" }]
@@ -31,4 +31,6 @@ markers = [
     # is a waiver, and this file has already shipped four of those.
     "attempts_egress: deliberately attempts egress to prove the guard refuses it",
     "required_gate: a check whose purpose is to gate. Skipping one is converted to a FAILURE by tests/conftest.py -- a gate that skips when its subject is absent is not a gate.",
+    "real_platform_shell: intentionally executes the REAL platform shell (cmd / $SHELL) -- the install-time outside-in seam. Everything else gets a refusing runner from tests/conftest.py so no test can silently write a launcher module into the developer's real user site-packages.",
+    "codex_matrix: the standing outside-in Codex matrix (test_codex_matrix.py) -- real shells and real codex against tracked hostile paths; the definition of 'Codex support works'. Run the grid with `-m codex_matrix`. PRE-RELEASE GATE CANDIDATE: wiring it into the deploy pipeline is the operator's call (2026-08-05 launcher plan -- flagged, not gated).",
 ]

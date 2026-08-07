@@ -21,6 +21,7 @@ requires it and the CLI requires --surface. Unknown ownership fails closed;
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -289,8 +290,123 @@ def uninstall_claude(claude_dir, *, mcp_remover=None) -> dict:
     }
 
 
+#: Removal is authorized by CONTENT, never by filename — a user's own module
+#: of the same name is not ours to touch. The structured ownership record
+_LAUNCHER_CANDIDATES = ("python", "py", "python3")
+#: Current filename plus every superseded one we may still need to clean up.
+#: The legacy name is judged by codex_wiring.is_legacy_generated_launcher —
+#: a structural fingerprint of what the old generator actually emitted —
+#: never by any substring: this module deliberately carries NO ownership
+#: grammar of its own (a test pins that), because two implementations of
+#: "is this ours" is how the reviewer deleted a stranger's file over one
+#: quoted sentence (remediation audit H02).
+_LAUNCHER_FILENAMES = ("allostat_mcp_codex_launcher.py", "allostat_hook.py")
+_LEGACY_LAUNCHER_FILENAME = "allostat_hook.py"
+
+
+def _candidate_user_sites() -> list[Path]:
+    """Every user site-packages directory a canonical interpreter token
+    resolves to on this machine — the same candidate set the installer selects
+    from, probed READ-ONLY (`<candidate> -m site --user-site`), deduplicated
+    (py and python frequently name the same interpreter). A candidate that is
+    missing, errors, or reports nothing usable is skipped silently: uninstall
+    must keep working on a machine whose Python has changed since install."""
+    sites: list[Path] = []
+    seen: set[str] = set()
+    for candidate in _LAUNCHER_CANDIDATES:
+        try:
+            proc = subprocess.run(
+                [candidate, "-m", "site", "--user-site"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines or not os.path.isabs(lines[-1]):
+            continue
+        key = os.path.normcase(lines[-1])
+        if key not in seen:
+            seen.add(key)
+            sites.append(Path(lines[-1]))
+    return sites
+
+
+def _launcher_is_ours(filename: str, text: str) -> bool:
+    """True only for a launcher file Allostat provably generated — decided by
+    the ONE wiring authority, never by any grammar of this module's own.
+
+    Current filename: the strict structured ownership record. Legacy filename
+    (pre-record era): positive structural identification of the shape the old
+    generator actually emitted. A file matching neither — and EVERY file when
+    the wiring module cannot be imported — is foreign and stays: an
+    uninstaller that cannot PROVE ownership preserves. (The previous version
+    fell back to a raw substring here and deleted a stranger's module over
+    one quoted sentence — remediation audit H02.)"""
+    try:
+        import codex_wiring  # lazy: the same single authority the installer uses
+    except Exception:
+        return False
+    if filename == _LEGACY_LAUNCHER_FILENAME:
+        checker = getattr(codex_wiring, "is_legacy_generated_launcher", None)
+        return bool(checker is not None and checker(text))
+    reader = getattr(codex_wiring, "read_launcher_ownership", None)
+    return bool(reader is not None and reader(text) is not None)
+
+
+def _remove_launcher_modules() -> tuple[list[str], list[str]]:
+    """Remove OUR generated launcher module from every candidate user site.
+
+    Both the current filename and every superseded one are swept, because a
+    machine upgraded across the rename would otherwise keep the old module
+    forever. Returns (removed, preserved): ``preserved`` lists same-named
+    objects that were NOT provably ours — foreign files, but also symlinks,
+    junctions, directories, special objects, and unreadable files, none of
+    which are ever read through or removed."""
+    try:
+        import codex_wiring  # the ONE ownership authority; without it nothing
+        # can be proven ours, so nothing is touched at all.
+    except Exception:
+        return [], []
+    removed: list[str] = []
+    preserved: list[str] = []
+    for site_dir in _candidate_user_sites():
+        for filename in _LAUNCHER_FILENAMES:
+            module = site_dir / filename
+            kind = codex_wiring.classify_path_kind(module)
+            if kind == "missing":
+                continue
+            if kind != "file":
+                # A symlink/junction, directory, or special object under our
+                # module's name is ambiguous at best and a trap at worst:
+                # never followed, never removed — reported, not skipped.
+                preserved.append(str(module))
+                continue
+            try:
+                text = module.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                # Unreadable: cannot prove ownership, so it stays (inert once
+                # the config block is gone) and the report says so.
+                preserved.append(str(module))
+                continue
+            if _launcher_is_ours(filename, text):
+                try:
+                    module.unlink()
+                except OSError:
+                    preserved.append(str(module))
+                    continue
+                removed.append(str(module))
+            else:
+                preserved.append(str(module))
+    return removed, preserved
+
+
 def uninstall_codex(codex_config, standalone_wrapper=None) -> dict:
-    """Remove the Codex block and the owned standalone wrapper, if present.
+    """Remove the Codex block, the generated user-site launcher module(s), and
+    the owned standalone wrapper, if present.
 
     Non-Allostat Codex configuration, the recovery credential, and every other
     ``~/.allostat`` path are preserved.
@@ -300,6 +416,7 @@ def uninstall_codex(codex_config, standalone_wrapper=None) -> dict:
     import codex_wiring  # lazy: only the Codex surface needs the helper
 
     removed = codex_wiring.uninstall(codex_config)
+    launcher_removed, launcher_preserved = _remove_launcher_modules()
     wrapper_removed = False
     wrapper_refused = False
     wrapper_path = Path(standalone_wrapper) if standalone_wrapper is not None else None
@@ -323,6 +440,8 @@ def uninstall_codex(codex_config, standalone_wrapper=None) -> dict:
         "surface": "codex",
         "config": str(codex_config),
         "block_removed": removed,
+        "launcher_modules_removed": launcher_removed,
+        "launcher_modules_preserved": launcher_preserved,
         "wrapper": str(wrapper_path) if wrapper_path is not None else None,
         "wrapper_removed": wrapper_removed,
         "wrapper_refused": wrapper_refused,

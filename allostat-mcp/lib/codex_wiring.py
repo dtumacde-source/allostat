@@ -21,17 +21,39 @@ Design invariants (advisor 2026-07-06 installer asks):
      memory, no state, no other config. Removing the block fully disables the
      Codex integration; the user's files are never in scope here.
 
+Emission (2026-08-05, H01 closure — the launcher grammar): every hook `command`
+line is the CANONICAL INTERSECTION GRAMMAR —
+`python -P -m allostat_mcp_codex_launcher <event> --harness codex` — every
+token bare, drawn from [A-Za-z0-9_.-]; one form for every shell Codex may hand
+the command to (cmd with or without DelayedExpansion, PowerShell, POSIX) AND
+for the old whitespace-splitting runtime (<=0.145). No machine path, no
+quoting, and NO version probe on the emit path; machine paths live in the
+launcher module the installer generates into the user's site-packages
+(`render_installed_launcher`), which the `-P` keeps a project directory from
+shadowing. Do not hand-write that command anywhere: `canonical_hook_command()`
+is the single source, and the shipped documentation is RENDERED from it
+(`wrapper/tests/_launcher_doc_contract.py`).
+
+The per-shell quoting/refusal machinery below (`_codex_command_token`,
+`_windows_short_path`, the quote-aware recognition) is RETAINED for
+recognizing and migrating LEGACY configs — it is never used to emit.
+`codex_cli_version()` remains only for the update notice.
+
 All functions are pure text transforms (no I/O) except read_config/write_config,
-so the logic is unit-testable without a real config.toml. Output is verified to
-parse as TOML by the tests (tomllib).
+`render_installed_launcher` (reads the launcher source shipped beside this
+module), and the codex version probe (`_default_version_probe`, update-notice
+only). Output is verified to parse as TOML by the tests (tomllib).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import shlex
+import shutil
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -60,6 +82,425 @@ _DEFAULT_TOKEN_ENV_VAR = "ALLOSTAT_MCP_TOKEN"
 # backstop above the wrapper's internal ~12s MCP retry budget, so a hung network
 # call cannot block a Codex turn indefinitely.
 _HOOK_TIMEOUT_SECONDS = 15
+
+# --- the canonical intersection grammar (H01 closure, 2026-08-05) ------------
+#
+# ONE command per hook, identical for every shell and every Codex generation:
+#
+#     python -P -m allostat_mcp_codex_launcher <event> --harness codex
+#
+# Every token is bare and drawn from _INTERSECTION_CHARS, so cmd (/V:ON or
+# /V:OFF), PowerShell 5.1/7, POSIX shells, and the <=0.145 whitespace-splitting
+# runtime all parse it identically (measured GO — hub
+# audits/20260805_codex_launcher_gate_measured.md: 18/18 real-shell cells plus
+# real codex 0.146 on hostile roots). Machine paths never appear on the command
+# line — they live in the installed launcher module. Emission, validation,
+# migration, docs pins, and the matrix suite ALL derive the command from
+# canonical_hook_command; no caller hand-writes the string (M01's structural
+# fix: nothing runtime-resolved exists for two probes to disagree about).
+#
+# `-P` and the module NAME are the second-round H01 closure (2026-08-05
+# launcher audit). `python -m` searches the current working directory ahead of
+# user site-packages, so the original short name `allostat_hook` could be
+# shadowed by a project file of the same name, which then executed through
+# Codex's globally trusted hook command. `-P` removes cwd from `sys.path`
+# outright, and the long owned name removes the collision surface itself.
+#
+# `-P` is emitted UNCONDITIONALLY and that is load-bearing: the flag exists in
+# CPython 3.11+, and 3.11 is already this package's minimum supported
+# interpreter, so one identical string is correct on every supported Python.
+# A version-CONDITIONAL flag would rebuild the exact discriminator construction
+# two prior audits held this branch for. `test_min_python_floor_permits_
+# unconditional_safe_path` pins the floor so lowering it fails the suite
+# instead of silently splitting the grammar.
+
+CANONICAL_PYTHON_TOKENS = ("python", "py", "python3")
+#: Emitted between the interpreter token and `-m`. Bare, inside the
+#: intersection set, and unconditional — see the note above.
+CANONICAL_SAFE_PATH_FLAG = "-P"
+#: The lowest interpreter version on which CANONICAL_SAFE_PATH_FLAG exists.
+#: Must stay <= the package's MIN_PYTHON for the flag to be unconditional.
+SAFE_PATH_FLAG_MIN_PYTHON = (3, 11)
+_CANONICAL_MODULE = "allostat_mcp_codex_launcher"
+_EVENT_TOKEN = {
+    "SessionStart": "session-start",
+    "Stop": "stop",
+    "PreToolUse": "pre-tool-use",
+    "UserPromptSubmit": "user-prompt-submit",
+}
+_INTERSECTION_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.- "
+)
+
+
+def canonical_hook_command(hook: str, *, python_token: str = "python") -> str:
+    """The one command line emitted for `hook`, in the intersection grammar.
+
+    python_token is the interpreter name the installer selected and PROVED by
+    outside-in self-check (install/codex/install.py) — always a member of
+    CANONICAL_PYTHON_TOKENS, never a path."""
+    if python_token not in CANONICAL_PYTHON_TOKENS:
+        raise ValueError(
+            f"python_token must be one of {CANONICAL_PYTHON_TOKENS}, got {python_token!r}"
+        )
+    if hook not in _EVENT_TOKEN:
+        raise ValueError(
+            f"unknown hook {hook!r} (expected one of {tuple(_EVENT_TOKEN)})"
+        )
+    command = (
+        f"{python_token} {CANONICAL_SAFE_PATH_FLAG} -m {_CANONICAL_MODULE} "
+        f"{_EVENT_TOKEN[hook]} --harness codex"
+    )
+    stray = set(command) - _INTERSECTION_CHARS
+    if stray:  # unreachable today; a tripwire should the constants ever drift
+        raise AssertionError(f"canonical command left the intersection set: {stray!r}")
+    return command
+
+
+def matches_canonical_hook_command(command: str, hook: str) -> bool:
+    """Exact-form validation: True only when `command` IS the canonical line
+    for `hook` under one of the allowed interpreter tokens. String equality
+    against the same constant emission uses — no tokenizer, no version probe,
+    nothing runtime-resolved (the M01 closure by construction)."""
+    if hook not in _EVENT_TOKEN:
+        return False
+    return any(
+        command == canonical_hook_command(hook, python_token=token)
+        for token in CANONICAL_PYTHON_TOKENS
+    )
+
+
+def proof_hook_command(hook: str, *, python_token: str = "python", nonce: str) -> str:
+    """The install-proof invocation for `hook` — same grammar, same alphabet,
+    same constants as `canonical_hook_command`, plus the `--install-proof`
+    flag and the per-run nonce. Never written into any config (the exact-form
+    validator refuses any command carrying the flag): the installer runs this
+    through the shell lane at proof time and validates the identity line the
+    launcher prints. Emission stays single-sourced here for the same M01
+    reason as the canonical line — no caller hand-writes command strings."""
+    if python_token not in CANONICAL_PYTHON_TOKENS:
+        raise ValueError(
+            f"python_token must be one of {CANONICAL_PYTHON_TOKENS}, got {python_token!r}"
+        )
+    if hook not in _EVENT_TOKEN:
+        raise ValueError(
+            f"unknown hook {hook!r} (expected one of {tuple(_EVENT_TOKEN)})"
+        )
+    if len(nonce) != 32 or not all(c in "0123456789abcdef" for c in nonce):
+        raise ValueError("nonce must be 32 lowercase hex characters")
+    command = (
+        f"{python_token} {CANONICAL_SAFE_PATH_FLAG} -m {_CANONICAL_MODULE} "
+        f"--install-proof {nonce} {_EVENT_TOKEN[hook]}"
+    )
+    stray = set(command) - _INTERSECTION_CHARS
+    if stray:  # unreachable today; a tripwire should the constants ever drift
+        raise AssertionError(f"proof command left the intersection set: {stray!r}")
+    return command
+
+
+_LAUNCHER_SENTINEL = (
+    "HOOKS_DIR = None  # BAKED AT INSTALL — the installer substitutes this line."
+)
+
+#: The module file name the installer writes into user site-packages.
+LAUNCHER_MODULE_FILENAME = f"{_CANONICAL_MODULE}.py"
+
+# --- ownership sentinel (H02, 2026-08-05; format 2 same day) -----------------
+#
+# The installer may replace a user-site launcher ONLY when the file already on
+# disk carries this exact structured line. Parsing is strict (fixed key order,
+# exact values, integer format version) rather than a substring search, so a
+# foreign file that merely mentions Allostat is still foreign. The line lives
+# in the launcher source itself; `read_launcher_ownership` is the one reader,
+# shared by the installer (before writing) and uninstall (before removing).
+#
+# Format 2 is the LEADING-HEADER grammar, and the position is part of the
+# format: exactly one record in the whole file, in the leading comment block
+# before the first executable token, at column zero. Format 1 records lived
+# mid-file, where the tokenizer also emits column-zero comments INSIDE
+# bracketed continuations — which let a valid foreign file carry the record
+# as a real comment inside a parenthesized expression and be classified as
+# ours (reviewer, 2026-08-05 remediation audit; the same data-loss class as
+# the original H02). Mid-file records are therefore no longer ownership,
+# whoever wrote them.
+LAUNCHER_OWNERSHIP_LINE = (
+    "# allostat-launcher-ownership: owner=allostat "
+    "kind=allostat-codex-hook-launcher format=2"
+)
+_OWNERSHIP_RE = re.compile(
+    r"^#\s*allostat-launcher-ownership:\s*owner=(?P<owner>[A-Za-z0-9_.-]+)\s+"
+    r"kind=(?P<kind>[A-Za-z0-9_.-]+)\s+format=(?P<format>\d+)\s*$"
+)
+LAUNCHER_OWNER = "allostat"
+LAUNCHER_KIND = "allostat-codex-hook-launcher"
+LAUNCHER_FORMAT = 2
+
+
+def _ownership_records(text: str) -> tuple[list[str], int]:
+    """(header_records, total_matches) under the strict leading-header grammar.
+
+    Why a token walk rather than a line scan: a line-anchored regex also
+    matches inside a triple-quoted string, so a file that merely QUOTES our
+    ownership record — a vendored copy, a doc example, a fork's docstring —
+    would be mistaken for ours and overwritten (found attacking the first
+    version, 2026-08-05 self-review). Why the header rule on top of that: the
+    tokenizer emits comments inside bracketed continuations at column zero
+    too, so a valid foreign file could carry the record as a REAL comment
+    inside a parenthesized expression and still look "module-level" to a
+    column check (reviewer, 2026-08-05 remediation audit — reproduced, with
+    the foreign bytes destroyed by a successful install). The header block —
+    everything before the first token that is not a comment, a blank line, or
+    the encoding marker — cannot sit inside any expression, so bracket depth
+    is zero there by construction.
+
+    A file that does not tokenize as Python has no comments we can trust, and
+    is therefore not ours."""
+    import io
+    import tokenize
+
+    header: list[str] = []
+    total = 0
+    in_header = True
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text or "").readline):
+            if token.type == tokenize.COMMENT:
+                if _OWNERSHIP_RE.match(token.string.strip()):
+                    total += 1
+                    if in_header and token.start[1] == 0:
+                        header.append(token.string)
+            elif token.type not in (tokenize.NL, tokenize.ENCODING):
+                # The first real token — code, a docstring, even an opening
+                # bracket — ends the header block for good.
+                in_header = False
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return [], 0
+    return header, total
+
+
+def read_launcher_ownership(text: str) -> dict | None:
+    """Parse the structured ownership record out of a launcher file's text.
+
+    Returns {"owner", "kind", "format"} ONLY when the file carries EXACTLY ONE
+    ownership-shaped record and that record is a real comment in the leading
+    header block, at column zero, before the first executable token. A file
+    without such a record — or with more than one, anywhere, at any position —
+    is foreign, and the caller must refuse to overwrite or remove it: an
+    ambiguous claim of ownership is not ownership. This is the only thing
+    standing between the installer/uninstaller and someone else's module
+    (H02), so the grammar is deliberately an identity test, never a
+    resemblance test."""
+    header, total = _ownership_records(text)
+    if total != 1 or len(header) != 1:
+        return None
+    match = _OWNERSHIP_RE.match(header[0].strip())
+    if match is None:  # unreachable: header entries already matched the regex
+        return None
+    try:
+        record = {
+            "owner": match.group("owner"),
+            "kind": match.group("kind"),
+            "format": int(match.group("format")),
+        }
+    except ValueError:
+        return None
+    if record["owner"] != LAUNCHER_OWNER or record["kind"] != LAUNCHER_KIND:
+        return None
+    return record
+
+
+# --- legacy launcher identification (H02, uninstall path) --------------------
+#
+# The pre-record generator (allostat_hook.py era, built de815b8..c75f925,
+# never shipped) wrote no ownership record — so the uninstaller used to fall
+# back to a raw substring test for the bake sentence, and the reviewer
+# demonstrated that deleting a stranger's file over one quoted sentence
+# (remediation audit H02). Legacy cleanup now requires the STRUCTURE that
+# generator actually emitted, all prongs conjunctive, none of them a
+# substring: the file parses; HOOKS_DIR is a baked string assignment; the
+# exact bake comment is a REAL comment token; EVENT_SCRIPTS is a dict literal
+# with exactly our four event names. A file some person wrote does not have
+# this shape unless it IS a copy of our generated module.
+
+_LEGACY_BAKE_COMMENT = "# baked by the Allostat Codex installer"
+_LEGACY_EVENT_KEYS = frozenset(
+    ("session-start", "stop", "pre-tool-use", "user-prompt-submit")
+)
+
+
+def is_legacy_generated_launcher(text: str) -> bool:
+    """Positive structural identification of the pre-record generated
+    `allostat_hook.py`. Consulted ONLY for that legacy filename, ONLY by
+    uninstall; the current filename is judged solely by
+    `read_launcher_ownership`."""
+    try:
+        tree = ast.parse(text or "")
+    except (SyntaxError, ValueError):
+        return False
+    hooks_dir_is_baked_string = False
+    event_keys = None
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id == "HOOKS_DIR":
+            hooks_dir_is_baked_string = isinstance(
+                node.value, ast.Constant
+            ) and isinstance(node.value.value, str)
+        elif target.id == "EVENT_SCRIPTS" and isinstance(node.value, ast.Dict):
+            keys: set | None = set()
+            for key in node.value.keys:
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                    keys = None
+                    break
+                keys.add(key.value)
+            event_keys = keys
+    if not hooks_dir_is_baked_string or event_keys != set(_LEGACY_EVENT_KEYS):
+        return False
+    import io
+    import tokenize
+
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if (
+                token.type == tokenize.COMMENT
+                and token.string.strip() == _LEGACY_BAKE_COMMENT
+            ):
+                return True
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return False
+    return False
+
+
+def classify_path_kind(path: Path) -> str:
+    """What is AT `path`, without following links: "missing" | "file" |
+    "symlink" | "directory" | "special". Junctions classify as "symlink" on
+    Python 3.12+ (`Path.is_junction`); on 3.11 the method does not exist and
+    a junction's lstat mode reads as a directory — either way a junction is a
+    refuse-kind, never "file", which is the property callers rely on.
+
+    The shared filesystem primitive under every ownership decision — the
+    installer's pre-write classification and uninstall's removal sweep both
+    refuse to read or remove through anything that is not a plain regular
+    file, and they must agree on what that means: a divergence here is how
+    one path stays hardened while the other deletes through a junction.
+    install.py keeps a local twin (`_lstat_kind`) for its non-ownership
+    plumbing; a parity test pins the two equal kind-for-kind."""
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            if is_junction():
+                return "symlink"
+        except OSError:
+            return "special"
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "special"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "special"
+
+
+def is_allostat_launcher(text: str) -> bool:
+    """True only for a launcher file this installer owns and understands.
+
+    An unknown FUTURE format version is deliberately NOT ours to overwrite:
+    a newer Allostat wrote it, and an older installer clobbering it is the
+    same data-loss shape H02 described."""
+    record = read_launcher_ownership(text)
+    return record is not None and record["format"] <= LAUNCHER_FORMAT
+
+
+def render_installed_launcher(hooks_dir: str | Path) -> str:
+    """The user-site launcher module source with `hooks_dir` baked in.
+
+    Reads the launcher source shipped beside this module and substitutes its
+    single HOOKS_DIR sentinel line. The baked value is a repr'd Python string
+    literal, so apostrophes and backslashes in an install path can never break
+    the generated file. Raises when the sentinel is missing or duplicated —
+    source drift must fail the install loudly, never bake into the wrong line —
+    and equally when the generated text would not carry the ownership record,
+    since an unowned generated file is one the next install would refuse to
+    replace."""
+    source_path = Path(__file__).resolve().parent / LAUNCHER_MODULE_FILENAME
+    source = source_path.read_text(encoding="utf-8")
+    if source.count(_LAUNCHER_SENTINEL) != 1:
+        raise RuntimeError(
+            f"launcher source sentinel missing or duplicated in {source_path}; "
+            "cannot bake the hooks directory"
+        )
+    baked_line = (
+        f"HOOKS_DIR = {str(hooks_dir)!r}  # baked by the Allostat Codex installer"
+    )
+    generated = source.replace(_LAUNCHER_SENTINEL, baked_line)
+    if not is_allostat_launcher(generated):
+        raise RuntimeError(
+            f"launcher source at {source_path} is missing the structured "
+            f"ownership record ({LAUNCHER_OWNERSHIP_LINE!r}); refusing to "
+            "generate a module the installer could not later recognise as its own"
+        )
+    return generated
+
+#: CORRECTION (2026-08-05 closure audit, H01): this boundary is NOT a
+#: hook-grammar discriminator and the emit path no longer consults any version.
+#: Codex hands hook commands to the user's ACTIVE shell
+#: (`TurnEnvironment.shell`); `%COMSPEC% /C` / `$SHELL -lc` is only the
+#: empty-program fallback — and that architecture exists in BOTH 0.145 and
+#: 0.146 (measured against real binaries and upstream source; the previously
+#: asserted source-level boundary was wrong). The canonical intersection
+#: grammar (`canonical_hook_command`) parses identically on every side, which
+#: is why emission needs no discriminator at all. This constant and
+#: `codex_splits_on_whitespace` survive ONLY for the update notice and for
+#: recognizing LEGACY configs during migration/uninstall.
+_CODEX_SHELL_EXEC_MIN = (0, 146, 0)
+
+_CODEX_VERSION_RE = re.compile(r"codex-cli\s+(\d+)\.(\d+)\.(\d+)")
+
+
+def _default_version_probe() -> str:
+    exe = shutil.which("codex")
+    if not exe:
+        raise OSError("codex not on PATH")
+    return subprocess.run(
+        [exe, "--version"], capture_output=True, text=True, timeout=20
+    ).stdout
+
+
+def codex_cli_version(probe=None) -> tuple[int, int, int] | None:
+    """The installed codex-cli version, or None when it cannot be determined.
+
+    Never raises: a missing binary, a timeout, or unrecognised output all yield
+    None, and callers treat None as the OLD behaviour.
+    """
+    try:
+        raw = (probe or _default_version_probe)()
+        m = _CODEX_VERSION_RE.search(raw or "")
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+
+def codex_splits_on_whitespace(version: tuple[int, int, int] | None) -> bool:
+    """True when this Codex splits hook commands on whitespace and never unquotes.
+
+    Unknown version ⇒ True. Emitting a bare token to a shell-based runtime still
+    works for space-free paths; emitting a quoted token to a splitting runtime
+    puts literal quote characters into the filename and the hook never launches.
+    So the conservative direction is 'assume it splits'.
+    """
+    if version is None:
+        return True
+    return version < _CODEX_SHELL_EXEC_MIN
 
 
 def _toml_literal(s: str) -> str:
@@ -161,38 +602,84 @@ def _windows_short_path(value: str) -> str | None:
     return short
 
 
-def _codex_command_token(value: str) -> str:
-    """Return `value` as one token Codex's hook-command splitter can recover.
+def _codex_command_token(value: str, *, splits_on_whitespace: bool = True, windows_shell: bool | None = None) -> str:
+    """LEGACY-RECOGNITION layer: `value` as one token the way OLD emitters
+    rendered it. Never called on the emit path anymore — the canonical
+    launcher grammar carries no paths at all (see canonical_hook_command).
+    Retained so migration and uninstall can reproduce and recognize exactly
+    what old installs wrote.
 
-    Codex does NOT perform shell quote processing on a hook `command`. Measured
-    against codex-cli 0.145.0 on 2026-07-26 (see
-    `audits/20260726_codex_hook_failure_measured_corrections.md`): the string is split on
-    whitespace and quote characters are kept LITERALLY, so
+    codex-cli 0.145.0 and earlier split the hook `command` on whitespace and kept
+    quote characters LITERALLY, so a quoted path corrupted the filename and a
+    whitespace-bearing path could not be expressed at all. Those releases got a
+    BARE token, retried as the Windows 8.3 short form.
 
-      * quoting a path corrupts it — the quote characters land in the filename
-        and the hook process never launches, and
-      * a path containing whitespace cannot be expressed as one token at all.
+    codex-cli 0.146.0-era emitters modeled a shell runtime and quoted or
+    refused characters per shell. CORRECTION (2026-08-05 closure audit, H01):
+    the model those emitters assumed — `%COMSPEC% /C` on Windows, `$SHELL -lc`
+    on POSIX — was the empty-program FALLBACK only; Codex actually hands hook
+    commands to the user's ACTIVE shell (PowerShell for most Windows users),
+    in BOTH 0.145 and 0.146, which is why no per-shell quoting model could be
+    right and the launcher grammar superseded this path. The behavior below is
+    preserved bit-for-bit anyway, because recognizing what old emitters WROTE
+    requires reproducing what they DID: bare for [A-Za-z0-9_./:+-]; quoted
+    otherwise; refusal (with the recorded reason text) for characters the
+    modeled shell could not neutralize inside double quotes — on Windows `"`,
+    `%`, and `!` (delayed expansion), on POSIX `"`, `$`, backtick, backslash.
 
-    (A `command` + `args` array was also tested: Codex ignores `args` silently
-    and reports the hook Completed while running nothing. Never emit that form.)
-
-    So tokens are emitted BARE. Whitespace is first retried as the Windows 8.3
-    short form; if that is unavailable the path is not expressible and we raise
-    rather than write a config that cannot work.
+    (A `command` + `args` array was also tested against 0.145: Codex ignores
+    `args` silently and reports the hook Completed while running nothing. Never
+    emit that form.)
     """
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise CodexPathNotExpressible(
             f"Path contains a control character and cannot be used in a Codex "
             f"hook command: {value!r}"
         )
+
+    if not splits_on_whitespace:
+        # A shell runtime: determine if we're on Windows or POSIX
+        on_windows = windows_shell if windows_shell is not None else (os.name == "nt")
+
+        # Safe character set: only bare these characters
+        safe_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:+-")
+
+        # Unquotable characters (remain dangerous even inside double quotes)
+        if on_windows:
+            # cmd.exe: double quote, % (var expansion), and ! (delayed-expansion
+            # !VAR! substitution) are unquotable.
+            unquotable = {'"', '%', '!'}
+            unquotable_desc = (
+                "double quote, percent sign, or exclamation point (cmd.exe expands "
+                "%VAR% even in quotes, and substitutes !VAR! even in quotes when "
+                "delayed expansion is on — either /V:ON or the DelayedExpansion "
+                "registry value)"
+            )
+        else:
+            # POSIX shell: double quote, $, backtick, and backslash are unquotable
+            unquotable = {'"', '$', '`', '\\'}
+            unquotable_desc = "double quote, dollar sign, backtick, or backslash (all live in POSIX double quotes)"
+
+        # Check for unquotable characters first
+        for char in value:
+            if char in unquotable:
+                raise CodexPathNotExpressible(
+                    f"Path contains {unquotable_desc}, which cannot be escaped\n"
+                    f"in a {('cmd.exe' if on_windows else 'POSIX shell')} command:\n"
+                    f"    {value}\n"
+                    f"Fix: install under a path without that character, then re-run the installer."
+                )
+
+        # If all characters are in the safe set, return bare
+        if all(char in safe_chars for char in value):
+            return value
+
+        # Otherwise quote the token (metacharacters like &, |, <, >, ^, space are now safe)
+        return f'"{value}"'
+
     if _codex_token_is_clean(value):
         return value
 
-    # Only whitespace and a double quote get here (see _codex_token_is_clean),
-    # and 8.3 shortening is the one escape hatch for either: `C:\Program Files`
-    # becomes `C:\PROGRA~1`. It cannot help with an apostrophe — that is a legal
-    # 8.3 character, so `O'Brien` shortens to itself — which is exactly why the
-    # apostrophe is handled by parser tolerance instead of being refused here.
     short = _windows_short_path(value)
     if short is not None:
         short = short.replace("\\", "/")
@@ -201,14 +688,16 @@ def _codex_command_token(value: str) -> str:
 
     offender = "whitespace" if any(c.isspace() for c in value) else "a quote character"
     raise CodexPathNotExpressible(
-        f"Codex splits a hook command on whitespace and never unquotes it, so a "
-        f"path containing {offender} cannot be wired:\n"
+        f"This Codex splits a hook command on whitespace and never unquotes it, "
+        f"so a path containing {offender} cannot be wired:\n"
         f"    {value}\n"
         "Windows 8.3 short-name generation would normally solve this but is "
         "unavailable here (the path may not exist yet, or 8.3 names are disabled "
         "on this volume — check `fsutil 8dot3name query`).\n"
-        "Fix: install Allostat and Python under a path with no spaces or quotes, "
-        "or re-enable 8.3 name generation, then re-run the installer."
+        "Fix: upgrade to codex-cli 0.146.0 or newer, which runs hook commands "
+        "through a shell and accepts quoted paths; or install under a path with "
+        "no spaces or quotes, or re-enable 8.3 name generation, then re-run the "
+        "installer."
     )
 
 
@@ -267,55 +756,44 @@ def render_sandbox_table(writable_root: str | Path) -> list[str]:
 
 
 def render_block(
-    hooks_dir: str | Path,
-    python_exe: str | Path,
     *,
     server_url: str = _DEFAULT_SERVER_URL,
     token_env_var: str = _DEFAULT_TOKEN_ENV_VAR,
     sandbox_writable_root: str | Path | None = None,
+    python_token: str = "python",
 ) -> str:
     """Render the managed config.toml block (between the fences, inclusive).
 
-    hooks_dir is the directory that directly contains the hook .py files — the
-    caller supplies it so this module is agnostic to install layout (the INSTALLED
-    plugin flattens to <plugin>/hooks/, while the monorepo is <repo>/wrapper/hooks/).
+    Every hook `command` is the canonical intersection line from
+    `canonical_hook_command()` — identical for ALL Codex generations and every
+    shell, carrying no machine path and no character outside the intersection
+    set. There is deliberately NO version probe here and NO path parameter:
+    the installed launcher module owns the machine paths (H01/M01 closure,
+    2026-08-05; supersedes the version-gated bare-vs-quoted emission, whose
+    machinery survives in this module only to recognize legacy configs).
+
+    python_token is the installer-selected interpreter name — a member of
+    CANONICAL_PYTHON_TOKENS, proven able to fire the installed module by the
+    installer's post-write self-check before the config is trusted.
 
     NOTE the signature: there is NO raw-token parameter, only token_env_var
     (a NAME). The block wires Codex to read the bearer from the environment —
     a plaintext secret can never be written here (env-only-token invariant).
-
-    The Codex hook `command` is a single TOML STRING that Codex splits on
-    WHITESPACE, with no shell quote processing whatsoever (measured against
-    codex-cli 0.145.0; see `_codex_command_token`). Each path is therefore
-    emitted BARE — quoting it would put literal quote characters into the
-    filename and the hook would never launch — and the whole value is emitted as
-    a TOML *literal* string (single quotes; no backslash escaping, and Windows
-    paths are forward-slash-normalized). A path that cannot be expressed without
-    whitespace raises CodexPathNotExpressible so the installer aborts instead of
-    writing a config that silently does nothing. (H-23, corrected 1.4.74.)
     """
-    hd = str(hooks_dir).replace("\\", "/").rstrip("/")
-    py = str(python_exe).replace("\\", "/")
     lines = [
         _BEGIN,
         "[mcp_servers.allostat]",
         f'url = "{server_url}"',
         f'bearer_token_env_var = "{token_env_var}"',
     ]
-    py_token = _codex_command_token(py)
     for hook in _HOOKS:
-        script = _HOOK_SCRIPT[hook]
-        # Bare tokens: Codex splits on whitespace and never unquotes.
-        cmd = (
-            f"{py_token} "
-            f"{_codex_command_token(f'{hd}/{script}')} --harness codex"
-        )
+        command = canonical_hook_command(hook, python_token=python_token)
         lines += [
             "",
             f"[[hooks.{hook}]]",
             f"[[hooks.{hook}.hooks]]",
             'type = "command"',
-            f"command = {_toml_literal(cmd)}",
+            f"command = {_toml_literal(command)}",
             f"timeout = {_HOOK_TIMEOUT_SECONDS}",
         ]
     if sandbox_writable_root is not None:
@@ -409,15 +887,52 @@ def _is_owned_hook_path(raw_path: str) -> bool:
     )
 
 
+#: The pre-`-P`, short-named canonical module this branch emitted before the
+#: 2026-08-05 launcher audit. Never emitted again; recognized so that
+#: `--refresh` migrates such a block and uninstall removes it. (It was never
+#: released, but it exists on this branch's own dev machines.)
+_SUPERSEDED_MODULES = ("allostat_hook",)
+
+
+def _is_canonical_hook_argv(argv: list[str]) -> bool:
+    """True when argv is the canonical launcher invocation — current form, or
+    a superseded Allostat launcher form we still own for migration.
+
+    The module names are Allostat's reserved namespace (like the
+    `mcp_servers.allostat` table), so these exact shapes are ours by
+    construction — no path check applies or is possible (the canonical line
+    carries none)."""
+    if not argv or argv[0] not in CANONICAL_PYTHON_TOKENS:
+        return False
+    rest = argv[1:]
+    # Current form carries the unconditional safe-path flag.
+    if rest[:1] == [CANONICAL_SAFE_PATH_FLAG]:
+        rest = rest[1:]
+        modules = (_CANONICAL_MODULE,)
+    else:
+        # No flag: only a superseded form can legitimately look like this.
+        modules = _SUPERSEDED_MODULES
+    return (
+        len(rest) == 5
+        and rest[0] == "-m"
+        and rest[1] in modules
+        and rest[2] in _EVENT_TOKEN.values()
+        and rest[3:] == ["--harness", "codex"]
+    )
+
+
 def _is_allostat_hook_command(stripped: str) -> bool:
-    """True only for an owned, exact Codex hook invocation.
+    """True only for an owned, exact Codex hook invocation — canonical
+    (launcher grammar) or legacy (path-bearing).
 
     Fenced blocks are owned by their markers.  This predicate is intentionally
-    narrower because it is used to delete *unfenced* legacy groups.
+    narrow because it is used to delete *unfenced* orphan groups.
     """
     argv = _parse_hook_command(stripped)
     if argv is None or len(argv) < 4:
         return False
+    if _is_canonical_hook_argv(argv):
+        return True
     if argv[-2:] != ["--harness", "codex"]:
         return False
     return _is_owned_hook_path(argv[-3])
@@ -731,13 +1246,17 @@ def write_config(config_path: str | Path, text: str) -> None:
         raise
 
 
-def install(config_path: str | Path, hooks_dir: str | Path, python_exe: str | Path,
+def install(config_path: str | Path,
             *, server_url: str = _DEFAULT_SERVER_URL,
             token_env_var: str = _DEFAULT_TOKEN_ENV_VAR,
-            sandbox_writable_root: str | Path | None = None) -> bool:
+            sandbox_writable_root: str | Path | None = None,
+            python_token: str = "python") -> bool:
     """Install the Codex block into config.toml (idempotent, marker-fenced).
 
-    hooks_dir directly contains the hook .py files (installed: <plugin>/hooks).
+    The block carries the canonical launcher commands only — no path parameters
+    exist here anymore (the installer bakes machine paths into the launcher
+    module it generates into user site-packages, not into config.toml).
+    python_token is the installer-selected interpreter name.
 
     Returns True when the `[sandbox_workspace_write]` table was written inside
     the fence. Returns False when `sandbox_writable_root` was requested but the
@@ -752,11 +1271,10 @@ def install(config_path: str | Path, hooks_dir: str | Path, python_exe: str | Pa
         and not has_foreign_sandbox_table(existing)
     )
     block = render_block(
-        hooks_dir,
-        python_exe,
         server_url=server_url,
         token_env_var=token_env_var,
         sandbox_writable_root=sandbox_writable_root if wrote_sandbox else None,
+        python_token=python_token,
     )
     write_config(config_path, install_block(existing, block))
     return wrote_sandbox
@@ -774,19 +1292,25 @@ def uninstall(config_path: str | Path) -> bool:
 
 def _cli(argv: list[str]) -> int:
     """Thin CLI so the PowerShell/shell installers can invoke this module:
-        codex_wiring.py install   <config> <hooks_dir> <python_exe> [token_env_var]
+        codex_wiring.py install   <config> [token_env_var]
         codex_wiring.py uninstall <config>
-    hooks_dir directly contains the hook .py files (installed: <plugin>/hooks).
+    The launcher grammar takes no path arguments — the config block never
+    carries machine paths (legacy `install <config> <hooks_dir> <python_exe>
+    [env_var]` is still ACCEPTED for old callers; the path arguments are
+    ignored, since only the installer's generated launcher module needs them).
     Note: no raw-token argument exists — install only ever takes the env-var name."""
-    if len(argv) >= 4 and argv[0] == "install":
-        env_var = argv[4] if len(argv) > 4 else _DEFAULT_TOKEN_ENV_VAR
-        install(argv[1], argv[2], argv[3], token_env_var=env_var)
+    if len(argv) >= 2 and argv[0] == "install":
+        if len(argv) >= 4:  # legacy arity: <config> <hooks_dir> <python_exe> [env_var]
+            env_var = argv[4] if len(argv) > 4 else _DEFAULT_TOKEN_ENV_VAR
+        else:
+            env_var = argv[2] if len(argv) > 2 else _DEFAULT_TOKEN_ENV_VAR
+        install(argv[1], token_env_var=env_var)
         print(f"Codex block installed in {argv[1]}")
         return 0
     if len(argv) == 2 and argv[0] == "uninstall":
         print(f"Codex block removed: {uninstall(argv[1])}")
         return 0
-    print("usage: codex_wiring.py {install <config> <plugin_root> <python> [env_var] "
+    print("usage: codex_wiring.py {install <config> [env_var] "
           "| uninstall <config>}", file=__import__("sys").stderr)
     return 2
 
