@@ -131,7 +131,20 @@ _SKIP_ENV_VAR = "ALLOSTAT_SKIP_INSTALL_VALIDATION"
 # Match either form so the regex doesn't silently fail on encoding drift.
 _PLUGIN_BLOCK_START = "❯ "
 _PLUGIN_BLOCK_START_ALT = "> "  # transcoded fallback
-_ALLOSTAT_PLUGIN_NAME = "allostat-mcp@local"
+# The plugin's name WITHOUT its marketplace suffix.
+#
+# This was `allostat-mcp@local` until 2026-08-07, and `@local` is the dev's own
+# marketplace. `claude plugin list` prints `allostat-mcp@<marketplace>`, so on
+# any install that did not come from `@local` the block was never found, the
+# check returned "not loaded", and the customer was told their install was
+# broken — "Claude Code rejected its manifest", "re-run the installer" — while
+# the hooks were demonstrably firing and the MCP server was connected.
+#
+# Found on the bench VM, where `claude plugin list` shows
+# `allostat-mcp@allostat` (disabled) and `allostat-mcp@allostat-devfix`
+# (enabled). It would fire for every marketplace customer: the one install
+# shape that passed was the developer's.
+_ALLOSTAT_PLUGIN_NAME = "allostat-mcp"
 
 # Status icons: ✔/√ for enabled, ✘/× for disabled. UTF-8 normally; locale-
 # transcoded forms also handled for defense in depth.
@@ -316,43 +329,63 @@ def check_plugin_loaded() -> bool | None:
     if rc != 0:
         return None
 
-    block = _extract_plugin_block(stdout, _ALLOSTAT_PLUGIN_NAME)
-    if block is None:
+    blocks = _extract_plugin_blocks(stdout, _ALLOSTAT_PLUGIN_NAME)
+    if not blocks:
         return False  # plugin not in listing → not loaded
-    if _PLUGIN_STATUS_ENABLED_RE.search(block):
+    # One ENABLED instance is enough. The same plugin legitimately appears
+    # under several marketplaces at once — the bench has it disabled under
+    # `@allostat` and enabled under `@allostat-devfix`, which is exactly how
+    # you test a candidate build — and in that state the plugin IS loaded.
+    if any(_PLUGIN_STATUS_ENABLED_RE.search(b) for b in blocks):
         return True
-    if _PLUGIN_STATUS_DISABLED_RE.search(block):
+    if any(_PLUGIN_STATUS_DISABLED_RE.search(b) for b in blocks):
         return False
-    # Block found but no status line — conservative: treat as not loaded
+    # Blocks found but no status line — conservative: treat as not loaded
     return False
 
 
-def _extract_plugin_block(output: str, plugin_name: str) -> str | None:
-    """Extract the multi-line block for the named plugin from
-    `claude plugin list` output.
+def _extract_plugin_blocks(output: str, plugin_name: str) -> list[str]:
+    """Every block for `plugin_name`, across all marketplaces.
 
-    Returns the block text (from `❯ <name>` line up to the next `❯` or
-    end of output), or None if the plugin isn't in the listing.
+    `claude plugin list` prints one block per installed instance, headed
+    `❯ <name>@<marketplace>`. The same plugin can legitimately be installed
+    from more than one marketplace at once, so this matches on the name and
+    returns them all rather than the first (or, before 2026-08-07, only the
+    one whose marketplace happened to be hardcoded).
 
-    Tolerates both UTF-8 (`❯ `) and locale-transcoded (`> `) block markers
-    -- claude.exe emits UTF-8 but legacy environments may downconvert.
+    A block runs from its marker to the next marker or end of output.
+    Tolerates both UTF-8 (`❯ `) and locale-transcoded (`> `) markers —
+    claude.exe emits UTF-8 but legacy environments may downconvert.
     """
-    # Try UTF-8 marker first, then transcoded fallback.
+    starts: list[int] = []
     for marker_char in (_PLUGIN_BLOCK_START, _PLUGIN_BLOCK_START_ALT):
-        marker = f"{marker_char}{plugin_name}"
-        start = output.find(marker)
-        if start == -1:
-            continue
-        # End of block: next marker (of either form), or end of string
-        end_candidates: list[int] = []
-        for end_marker in (_PLUGIN_BLOCK_START, _PLUGIN_BLOCK_START_ALT):
-            idx = output.find(end_marker, start + len(marker))
-            if idx != -1:
-                end_candidates.append(idx)
-        if not end_candidates:
-            return output[start:]
-        return output[start:min(end_candidates)]
-    return None
+        pattern = re.compile(
+            re.escape(marker_char) + re.escape(plugin_name) + r"(?:@\S*)?\s*$",
+            re.MULTILINE,
+        )
+        starts.extend(m.start() for m in pattern.finditer(output))
+    if not starts:
+        return []
+
+    # All block boundaries, so a block ends at the NEXT plugin of any name.
+    boundaries = sorted({
+        m.start()
+        for marker_char in (_PLUGIN_BLOCK_START, _PLUGIN_BLOCK_START_ALT)
+        for m in re.finditer(re.escape(marker_char), output)
+    })
+    blocks: list[str] = []
+    for start in sorted(set(starts)):
+        end = next((b for b in boundaries if b > start), len(output))
+        blocks.append(output[start:end])
+    return blocks
+
+
+def _extract_plugin_block(output: str, plugin_name: str) -> str | None:
+    """First block for `plugin_name`, or None. Retained for callers that want
+    a single block; `check_plugin_loaded` uses the plural form because one
+    enabled instance among several is still loaded."""
+    blocks = _extract_plugin_blocks(output, plugin_name)
+    return blocks[0] if blocks else None
 
 
 # ---------------------------------------------------------------------------

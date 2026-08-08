@@ -134,7 +134,10 @@ def should_inject(state_dir: Path | None) -> bool:
         return False
     try:
         import subscription_gate  # noqa: E402
-        return subscription_gate.is_active_subscription(state_dir)
+        active = subscription_gate.is_active_subscription(state_dir)
+        if not active:
+            _record_injection_suppressed(state_dir)
+        return active
     except Exception as e:  # noqa: BLE001
         # Fail CLOSED. "I could not determine entitlement" must never resolve
         # to "entitled" — that equivalence is the whole defect.
@@ -143,6 +146,33 @@ def should_inject(state_dir: Path | None) -> bool:
         except Exception:  # noqa: BLE001  # H3 audit fix: stderr-print itself raised
             pass
         return False
+
+
+def _record_injection_suppressed(state_dir: Path) -> None:
+    """Log that the gate turned regulation off, and on what evidence.
+
+    Silence toward the OPERATOR is the locked directive and stays. Silence in
+    the RECORD is a different thing and was a defect: when a rate limit pushed
+    331 of 676 benchmark sessions into a silent gate, nothing was written at
+    all — not even `session_start` — so the failure presented as random
+    injection loss with no way to reproduce it. A support ticket cannot be
+    answered from an empty log.
+
+    Best-effort and never raises: a gate that fails to log still gates.
+    """
+    try:
+        import subscription_gate  # noqa: E402
+        from local_state import append_observation  # noqa: E402
+
+        cache = subscription_gate.read_cached_state(state_dir) or {}
+        append_observation(state_dir, "injection_suppressed", details={
+            "subscription_state": cache.get("subscription_state"),
+            "source": cache.get("source"),
+            "error": cache.get("error"),
+            "validated_at": cache.get("validated_at"),
+        })
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def is_terminally_inactive(state_dir: Path | None) -> bool:

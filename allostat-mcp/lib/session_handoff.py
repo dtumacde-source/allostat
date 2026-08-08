@@ -66,30 +66,81 @@ _HANDOFF_STATE_FILENAME = "last_handoff_session.json"
 _HARNESS_POINTER_MARKER = "<!-- allostat:project-rooted-memory-pointer -->"
 
 
+#: Characters the Claude Code harness folds to "-" when naming a project
+#: directory under `~/.claude/projects/`.
+#:
+#: `_` was missing until 2026-08-07 (ISSUE-004). The harness maps it; Allostat
+#: did not, so ANY underscore in a cwd made the two disagree and every path
+#: derived from the sanitized name pointed at a directory that does not exist:
+#:
+#:   /home/bench/acc_under_home  ->  Allostat: -home-bench-acc_under_home
+#:                                   harness:  -home-bench-acc-under-home
+#:
+#: Two consumers derive from that name — `_harness_memory_root` (the fallback
+#: tree for un-migrated projects, which then read blank where memory existed)
+#: and the A2 audit path, whose files piled up in a phantom directory.
+#: Underscored folder names are ordinary (`my_project`), so this was not exotic.
+_HARNESS_SANITIZE_CHARS: tuple[str, ...] = (":", "\\", "/", " ", "_")
+
+
 def sanitize_cwd_for_harness(cwd: Path | str) -> str:
     """Convert a cwd path into the harness's sanitized form.
 
     Example: `C:\\Users\\<user>\\<project>` becomes
     `C--Users---user---project-` (colons, backslashes, forward slashes,
-    and spaces all become dashes). The Claude Code harness uses this
-    sanitization when computing the per-project memory tree path
+    spaces and underscores all become dashes). The Claude Code harness uses
+    this sanitization when computing the per-project memory tree path
     under `~/.claude/projects/`.
     """
     raw = str(cwd)
-    return (
-        raw.replace(":", "-")
-           .replace("\\", "-")
-           .replace("/", "-")
-           .replace(" ", "-")
-    )
+    for ch in _HARNESS_SANITIZE_CHARS:
+        raw = raw.replace(ch, "-")
+    return raw
+
+
+def legacy_sanitize_cwd_for_harness(cwd: Path | str) -> str:
+    """The pre-2026-08-07 form, which left `_` intact.
+
+    Read-time alias only. Directories were really written under this name
+    before the fix — audit trees and legacy fallback memory — and correcting
+    the sanitizer must not orphan them. Callers that RESOLVE a harness path
+    should try the canonical name first and fall back to this one; callers
+    that CREATE one must always use the canonical form.
+    """
+    raw = str(cwd)
+    for ch in (":", "\\", "/", " "):
+        raw = raw.replace(ch, "-")
+    return raw
+
+
+def harness_dir_candidates(cwd: Path | str) -> list[str]:
+    """Sanitized directory names to try when RESOLVING a harness path, in
+    priority order: the canonical name first, then the legacy underscore form
+    if it differs. Deduplicated, so the common case is a single candidate."""
+    canonical = sanitize_cwd_for_harness(cwd)
+    legacy = legacy_sanitize_cwd_for_harness(cwd)
+    return [canonical] if canonical == legacy else [canonical, legacy]
 
 
 def _harness_memory_root(project_root: Path) -> Path:
     """The legacy harness-rooted memory tree:
     `~/.claude/projects/<sanitized-cwd>/memory`. Kept as the FALLBACK target
-    for cwds that have not migrated to in-project memory."""
-    sanitized = sanitize_cwd_for_harness(project_root)
-    return Path.home() / ".claude" / "projects" / sanitized / "memory"
+    for cwds that have not migrated to in-project memory.
+
+    Resolves through `harness_dir_candidates`, so a tree written under the
+    pre-2026-08-07 underscore form is still found. An EXISTING legacy tree
+    wins over a canonical path that does not exist yet — otherwise correcting
+    the sanitizer would read blank for exactly the projects that already had
+    memory there. When neither exists, the canonical name is returned, so
+    anything created from here is created correctly.
+    """
+    projects = Path.home() / ".claude" / "projects"
+    candidates = harness_dir_candidates(project_root)
+    for name in candidates:
+        candidate = projects / name / "memory"
+        if candidate.is_dir():
+            return candidate
+    return projects / candidates[0] / "memory"
 
 
 def _iter_files_safe(root: Path, suffix: str | None = None, max_depth: int = 25):

@@ -39,7 +39,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,36 @@ FAIL_CLOSED_STATE: str = "unknown"
 # window. Anchored to the last SUCCESSFUL validation (`validated_at`), never
 # re-armed by a fault read — so a persistent outage exhausts grace and gates.
 CLIENT_GRACE_SECONDS: int = 300
+
+# A 429 is NOT an outage, and treating it as one locked a paying customer out
+# of their own entitlement (2026-08-07, found on the benchmark VM).
+#
+# What happened: a run opened hundreds of sessions in parallel; every
+# SessionStart validated entitlement; the server's rate limiter answered 429.
+# 429 fell into the generic HTTPError branch, so each one was scored as a
+# validation fault. Faults never re-arm grace — correctly, for an outage — so
+# 300s after the last 200 the client decided it could not confirm entitlement
+# and gated everything: no index, no rules, no regulation, and by design no
+# message. 331 of 676 sessions ran with Allostat silently inert, and it read as
+# nondeterminism because the cutover fell between two arms of a benchmark.
+#
+# But a 429 is affirmative evidence the opposite of an outage: the server is
+# up, reachable, and reading the request. It says "not so fast", not "I cannot
+# vouch for you". The client's correct response is to slow down and keep
+# serving last-known-good — never to start a countdown to locking the customer
+# out for the crime of using the product hard.
+#
+# So a throttle gets its own, wider window, still bounded and still anchored to
+# the last real validation (it cannot ride forever), plus client-side backoff
+# that stops the client amplifying the overload it is caught in.
+THROTTLE_STATUS_CODES: frozenset[int] = frozenset({429})
+CLIENT_THROTTLE_GRACE_SECONDS: int = 60 * 60
+
+# Fallback backoff when a 429 carries no Retry-After, and the ceiling for one
+# that does (a hostile or fat-fingered header must not park the client for a
+# day).
+THROTTLE_BACKOFF_DEFAULT_SECONDS: int = 60
+THROTTLE_BACKOFF_MAX_SECONDS: int = 900
 
 # R1 (2026-07-20) — the entitlement staleness horizon. A cached state older
 # than this has not been confirmed by any server recently enough to BE an
@@ -328,10 +358,20 @@ def _validation_anchor(cache: dict[str, Any] | None) -> datetime | None:
 
 
 def _last_known_good_within_grace(
-    prior: dict[str, Any] | None, *, now: datetime,
+    prior: dict[str, Any] | None,
+    *,
+    now: datetime,
+    window_seconds: int = CLIENT_GRACE_SECONDS,
 ) -> dict[str, Any] | None:
     """Return the prior cache iff it holds a known state validated within
-    `CLIENT_GRACE_SECONDS`. Otherwise None (grace unavailable/exhausted)."""
+    `window_seconds`. Otherwise None (grace unavailable/exhausted).
+
+    The window is a parameter because a throttle and an outage are different
+    facts: a 429 proves the server is reachable and reading requests, so it
+    gets `CLIENT_THROTTLE_GRACE_SECONDS` rather than the outage window. Both
+    are anchored to the last SUCCESSFUL validation and neither is re-armed by
+    a fault, so both still expire.
+    """
     if not isinstance(prior, dict):
         return None
     state = prior.get("subscription_state")
@@ -341,9 +381,33 @@ def _last_known_good_within_grace(
     if anchor is None:
         return None
     age_seconds = (now - anchor).total_seconds()
-    if age_seconds <= CLIENT_GRACE_SECONDS:
+    if age_seconds <= window_seconds:
         return prior
     return None
+
+
+def _parse_retry_after(value: Any) -> int:
+    """Seconds to back off from a Retry-After header value.
+
+    Only the delta-seconds form is honored; an HTTP-date form or junk falls
+    back to the default. Clamped to `THROTTLE_BACKOFF_MAX_SECONDS` so a bad
+    header cannot park the client indefinitely — that would be the lockout
+    this whole branch exists to prevent, handed to us by the server.
+    """
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return THROTTLE_BACKOFF_DEFAULT_SECONDS
+    if seconds <= 0:
+        return THROTTLE_BACKOFF_DEFAULT_SECONDS
+    return min(seconds, THROTTLE_BACKOFF_MAX_SECONDS)
+
+
+def _throttled_until(prior: dict[str, Any] | None) -> datetime | None:
+    """The instant a prior 429's backoff expires, if one is pending."""
+    if not isinstance(prior, dict):
+        return None
+    return _parse_iso(prior.get("throttled_until"))
 
 
 def _prior_confirmed_terminal(prior: dict[str, Any] | None) -> str | None:
@@ -376,7 +440,9 @@ def _prior_confirmed_terminal(prior: dict[str, Any] | None) -> str | None:
     state = prior.get("subscription_state")
     if not isinstance(state, str) or state not in TERMINAL_INACTIVE_STATES:
         return None
-    if prior.get("source") not in ("server", "cache_grace", "terminal_sticky"):
+    if prior.get("source") not in (
+        "server", "cache_grace", "cache_throttled", "terminal_sticky",
+    ):
         return None
     return state
 
@@ -498,6 +564,18 @@ def refresh_subscription_state(
 
     # Outcome of the server call: a validated state string, or a fault.
     server_state: str | None = None
+    # True when this resolution is standing down for a rate limit rather than
+    # failing to reach the server.
+    throttled = False
+
+    # A backoff from a previous 429 that has not expired: skip the call
+    # entirely. Hammering through a rate limit is what turned one throttle into
+    # a fleet-wide lockout, and the point of a backoff is to stop asking.
+    pending_backoff = _throttled_until(prior)
+    if pending_backoff is not None and now < pending_backoff:
+        throttled = True
+        cache["error"] = "throttled_backoff_pending"
+        cache["throttled_until"] = pending_backoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Resolution order: explicit argument, then the module attribute a test
     # shim may have installed, then production. A bearer is required only for
@@ -505,7 +583,10 @@ def refresh_subscription_state(
     # suite deliberately runs with no token and an isolated home.
     fetcher = fetch_fn or _STATE_FETCHER or _default_fetcher
 
-    if fetcher is _default_fetcher and not bearer:
+    if throttled:
+        # Backoff pending — deliberately no call this fire.
+        pass
+    elif fetcher is _default_fetcher and not bearer:
         cache["error"] = "missing_bearer"
     else:
         try:
@@ -534,6 +615,20 @@ def refresh_subscription_state(
                 # momentarily stale bearer) does not lock the operator out.
                 cache["error"] = "http_401_bearer_rejected"
                 cache["bearer_status"] = "rejected"
+            elif e.code in THROTTLE_STATUS_CODES:
+                # Throttled, not faulted. Record the backoff so the next hooks
+                # skip the call entirely instead of adding to the pile-up, and
+                # take the wider throttle window below.
+                cache["error"] = f"HTTPError:{e.code}:{e.reason}"
+                throttled = True
+                backoff = THROTTLE_BACKOFF_DEFAULT_SECONDS
+                try:
+                    backoff = _parse_retry_after(e.headers.get("Retry-After"))
+                except Exception:  # noqa: BLE001 — a header read must not fault
+                    pass
+                cache["throttled_until"] = (
+                    now + timedelta(seconds=backoff)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
                 cache["error"] = f"HTTPError:{e.code}:{e.reason}"
         except urllib.error.URLError as e:
@@ -554,10 +649,15 @@ def refresh_subscription_state(
         cache["source"] = "server"
         cache["validated_at"] = now_iso
         cache["error"] = None
+        # The rate limit is over; drop the backoff.
+        cache.pop("throttled_until", None)
     else:
         # Fault path — fail CLOSED, but honor last-known-good within grace so
-        # a single transient error can't hard-lock the operator.
-        grace = _last_known_good_within_grace(prior, now=now)
+        # a single transient error can't hard-lock the operator. A throttle
+        # takes the wider window: the server answered, it just asked us to
+        # slow down, and that is not a reason to stop vouching for a customer.
+        window = CLIENT_THROTTLE_GRACE_SECONDS if throttled else CLIENT_GRACE_SECONDS
+        grace = _last_known_good_within_grace(prior, now=now, window_seconds=window)
         terminal = _prior_confirmed_terminal(prior)
         if grace is not None:
             cache["subscription_state"] = grace["subscription_state"]
@@ -568,7 +668,7 @@ def refresh_subscription_state(
                 carried.strftime("%Y-%m-%dT%H:%M:%SZ")
                 if carried is not None else None
             )
-            cache["source"] = "cache_grace"
+            cache["source"] = "cache_throttled" if throttled else "cache_grace"
         elif terminal is not None:
             # N-M-01 part (a): grace is exhausted, but the prior state was a
             # server-CONFIRMED terminal-inactive (lapsed/canceled). That is a

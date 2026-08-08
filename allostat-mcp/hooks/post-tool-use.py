@@ -161,6 +161,21 @@ def _main() -> int:
                     details=classified_details,
                 )
 
+            # ISSUE-005 (2026-08-07): remember scripts this session wrote, so
+            # PreToolUse can recognise `bash /tmp/cl.sh` as running text the
+            # destructive guard never saw. Best-effort — a tracker that fails
+            # leaves innate-02 exactly as covered as it was before.
+            if file_path and tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                try:
+                    from session_script_tracker import record_write  # noqa: E402
+                    record_write(
+                        state_dir,
+                        payload.get("session_id") or payload.get("sessionId"),
+                        str(file_path),
+                    )
+                except Exception as e:
+                    emit_stderr(f"session script tracking failed: {e}")
+
     # Server dispatch — v0.2.0: every tool call, not just errors.
     if not has_mcp_token() or not tool_name:
         return 0

@@ -124,9 +124,19 @@ def _harness_memory_default(cwd: Path | None = None) -> Path | None:
     # Delegate sanitization to the canonical helper. Co-bundled with this
     # module; ImportError is not handled — a broken install must surface
     # rather than silently degrade.
-    from session_handoff import sanitize_cwd_for_harness  # noqa: E402
-    sanitized = sanitize_cwd_for_harness(cwd)
-    return Path.home() / ".claude" / "projects" / sanitized / "memory" / "handoffs"
+    from session_handoff import harness_dir_candidates  # noqa: E402
+
+    projects = Path.home() / ".claude" / "projects"
+    # ISSUE-004 (2026-08-07): a tree written before the sanitizer learned to
+    # fold `_` lives under the legacy name. This is a READ path, so an existing
+    # legacy directory wins over a canonical one that was never created —
+    # otherwise fixing the sanitizer would hide handoffs that are right there.
+    candidates = harness_dir_candidates(cwd)
+    for name in candidates:
+        candidate = projects / name / "memory" / "handoffs"
+        if candidate.is_dir():
+            return candidate
+    return projects / candidates[0] / "memory" / "handoffs"
 
 
 def _in_project_memory_default(cwd: Path | None = None) -> Path | None:

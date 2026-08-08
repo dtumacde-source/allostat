@@ -63,8 +63,14 @@ This is the project memory tree for sessions opened from this cwd. Allostat auto
 Each section below holds feedback / project / reference files Claude has learned about your workflow. Lines stay under 150 chars (auto-enforced by Allostat).
 
 Claude: THIS tree — not Claude Code's built-in `~/.claude` memory — is where this project's memory lives. To remember something for future
-sessions, write a leaf file in this folder (`feedback_*.md` / `project_*.md` / `reference_*.md`) and add a one-line entry for it in the
-matching section below. Allostat injects this index at every session start, so anything indexed here is found again next session.
+sessions, write a leaf file in this folder and add a one-line entry for it in the matching section below, in the SAME turn. Allostat injects
+this index at every session start, so anything indexed here is found again next session.
+
+Naming is not cosmetic: the `feedback_` / `project_` / `reference_` prefix is what routes a leaf into its section, and the one-line
+description is the only cue a future session gets for deciding whether to open it. Keep the prefix you started with for a given subject —
+renaming `caroline-profile.md` to `project_caroline.md` mid-project leaves two files where you meant one. If an unindexed leaf does turn up,
+Allostat folds it into this index at the next session start and flags any prefixed/unprefixed pair for `/allostat-tend`; that is a safety
+net, not the plan.
 
 ## Feedback
 

@@ -112,6 +112,7 @@ Active commands (S2 surface):
 - `/allostat-handoff-status` — handoff watchdog visibility
 - `/allostat-prune` — memory tree pruning to cold storage; subverbs `preview` / `execute` / `restore`
 - `/allostat-tend` — memory-tree hygiene umbrella (audit, retire, orphans, index rebuild, check-symlinks)
+- `/allostat-forget <text>` — retract something from memory; purges every store Allostat can reach and reports per store what it removed and what it could not. Previews by default
 - `/allostat-promote` — review pending pattern-observer proposals; promote approved ones to learned rules
 - `/allostat-manage-billing` — securely open the customer billing portal to manage or cancel a subscription
 - `/allostat record-migration [note]` — record a topology/rollout migration to clear the volume-control nudge

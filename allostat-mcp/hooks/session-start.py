@@ -985,10 +985,15 @@ def _inject_project_memory(project_root, state_dir, profile=None) -> None:
         mem_dir = memory_lifecycle.resolve_memory_dir(project_root)
         if mem_dir is None:
             return
-        block = memory_reader.build_memory_index_context(mem_dir)
+        block = memory_reader.build_memory_index_context(
+            mem_dir, max_chars=profile.memory_max_chars
+        )
         if not block:
             return
         if profile.memory_max_chars is not None and len(block) > profile.memory_max_chars:
+            # Backstop only — the renderer above already fitted the budget with
+            # the on-disk pointer preserved. This catches a header that ran
+            # long, not the index body.
             block = block[: profile.memory_max_chars] + (
                 "\n\n[memory index truncated for context budget — full MEMORY.md on disk]"
             )
@@ -1003,6 +1008,40 @@ def _inject_project_memory(project_root, state_dir, profile=None) -> None:
                 pass
     except Exception as e:
         emit_stderr(f"project memory inject failed: {e}")
+
+
+def _reconcile_memory_index(project_root, state_dir) -> None:
+    """Fold unindexed leaves into MEMORY.md before the index is read.
+
+    Append-only and non-destructive: no existing index line is rewritten or
+    reordered, no leaf is moved or deleted. Best-effort — a failure here must
+    never break session start, and leaves the index exactly as it was (the
+    injected block then carries its own "may be incomplete" note, since the
+    orphans it warns about are still there to be found).
+    """
+    if project_root is None:
+        return
+    try:
+        import memory_lifecycle  # noqa: E402
+
+        mem_dir = memory_lifecycle.resolve_memory_dir(project_root)
+        if mem_dir is None:
+            return
+        report = memory_lifecycle.reconcile_orphans(mem_dir)
+        if state_dir is not None and (report.get("indexed") or report.get("failed")
+                                      or report.get("pairs")):
+            try:
+                append_observation(state_dir, "index_reconciled", details={
+                    "scanned": report.get("scanned", 0),
+                    "indexed": len(report.get("indexed") or []),
+                    "failed": len(report.get("failed") or []),
+                    "sections": report.get("sections") or {},
+                    "convention_pairs": len(report.get("pairs") or []),
+                })
+            except Exception:
+                pass
+    except Exception as e:
+        emit_stderr(f"memory index reconcile failed: {e}")
 
 
 def _filter_appendix_exclude(files, profile):
@@ -1526,6 +1565,13 @@ def _main() -> int:
                     pass
         except Exception as e:
             emit_stderr(f"project scaffolder failed: {e}")
+
+    # 2026-08-07: index completeness becomes mechanical. Any leaf on disk that
+    # MEMORY.md doesn't name is appended to its section BEFORE anything reads
+    # or injects the index — because an index is read as an exhaustive
+    # inventory, so a partial one suppresses discovery of what it omits
+    # (measured worse than shipping no index at all).
+    _reconcile_memory_index(project_root, state_dir)
 
     # Workstream C (R3): root memory in <project>/memory/ BEFORE the index
     # injects — reconcile the legacy harness tree in (newest-wins, archive-not-

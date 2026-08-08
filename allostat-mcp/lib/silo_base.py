@@ -283,6 +283,102 @@ def extract_canonical_payload(entry_dict: dict) -> tuple[dict, str]:
     return payload, raw_excerpt
 
 
+def entry_identity(entry_dict: dict) -> tuple[str, str] | None:
+    """(fingerprint hash, success_marker) for a disk-shape silo line.
+
+    Returns None when the line can't be identified — a wire-shape line
+    carrying `token_hash` instead of `key_tokens`, a non-dict fingerprint, a
+    hand-edited record. Unidentifiable lines never coalesce; they are left
+    exactly as found.
+    """
+    fingerprint = entry_dict.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        return None
+    raw_tokens = fingerprint.get("key_tokens")
+    if not isinstance(raw_tokens, list):
+        return None
+    class_name = fingerprint.get("class_name")
+    fp = SiloFingerprint(
+        class_name=class_name if isinstance(class_name, str) else "",
+        key_tokens=[str(t) for t in raw_tokens],
+    )
+    marker = entry_dict.get("success_marker")
+    return fp.to_hash(), marker if isinstance(marker, str) else ""
+
+
+def coalesce_or_append(silo_path: Path, entry_dict: dict) -> bool:
+    """Fold a new entry onto an identical existing case, or append it.
+
+    A silo row is a CASE, and `fire_count` is how many times that case has
+    fired. Both silo write paths used to append unconditionally, so a case
+    seen 18 times became 18 rows each claiming `fire_count: 1` — the bench
+    VM's voice silo, exactly (2026-08-07). That is not a cosmetic duplicate
+    problem: `query_silo` ranks by `fire_count`, so the count that decides
+    what gets recalled was pinned at 1 forever, and every consumer reading
+    row counts as case counts was reading an inflated number.
+
+    Matching is on (fingerprint hash, success_marker) among non-decayed
+    rows, most recent first:
+      - same hash, same marker  → same case, same claim → bump.
+      - same hash, DIFFERENT marker → different claims about the same case
+        (a `voice_detected` row and a later `voice_corrected` row are two
+        distinct facts) → separate rows.
+      - decayed rows are closed history → never bumped; a fresh fire on a
+        decayed case starts a live row again.
+
+    On a bump the existing row is preserved field-for-field apart from
+    `fire_count` (+= incoming) and `last_fire` (:= incoming). The first
+    sighting stays the record of record; only the counter moves. Every other
+    line is rewritten BYTE-IDENTICAL, including lines that fail to parse, so
+    coalescing can never quietly reshape or drop a neighbouring record.
+
+    The caller holds the file lock; this does read-modify-write inside it.
+
+    Returns True if an existing row absorbed the entry, False if appended.
+    """
+    identity = entry_identity(entry_dict)
+    lines: list[str] = []
+    if identity is not None and silo_path.exists():
+        with silo_path.open("r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+        for i in range(len(lines) - 1, -1, -1):
+            raw = lines[i].strip()
+            if not raw:
+                continue
+            try:
+                existing = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(existing, dict) or existing.get("decayed"):
+                continue
+            if entry_identity(existing) != identity:
+                continue
+
+            prior = existing.get("fire_count")
+            if isinstance(prior, bool) or not isinstance(prior, (int, float)):
+                prior = 1
+            incoming = entry_dict.get("fire_count")
+            if isinstance(incoming, bool) or not isinstance(incoming, (int, float)):
+                incoming = 1
+            existing["fire_count"] = int(prior) + int(incoming)
+            new_fire = entry_dict.get("last_fire") or entry_dict.get("timestamp")
+            if isinstance(new_fire, str) and new_fire:
+                existing["last_fire"] = new_fire
+            lines[i] = json.dumps(existing, default=str)
+
+            tmp = silo_path.with_suffix(silo_path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line + "\n")
+            tmp.replace(silo_path)
+            return True
+
+    with silo_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry_dict, default=str) + "\n")
+    return False
+
+
 def write_entry(silo_path: Path, entry: SiloEntry) -> None:
     """Append a resolved case to the silo. Creates parent dir if missing.
 
@@ -372,8 +468,11 @@ def write_entry(silo_path: Path, entry: SiloEntry) -> None:
     except ImportError:
         lock_cm = contextlib.nullcontext()
     with lock_cm:
-        with silo_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(stripped, default=str) + "\n")
+        # Dedup fix (2026-08-07): repeat fires of one case bump that case's
+        # fire_count instead of laying down another row. Read-modify-write
+        # runs inside the lock the append already held, so a concurrent
+        # writer can neither miss the bump nor tear the rewrite.
+        coalesce_or_append(silo_path, stripped)
 
 
 def read_entries(silo_path: Path) -> Iterable[SiloEntry]:

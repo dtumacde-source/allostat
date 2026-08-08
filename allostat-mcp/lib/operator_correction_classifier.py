@@ -90,6 +90,79 @@ CORRECTION_PATTERNS: tuple[re.Pattern, ...] = (
         r"^\s*no[,.]\s*(?!problem|worry|worries|big deal)\w+",
         re.IGNORECASE,
     ),
+    # ---- Disagreement shapes (2026-08-07) ----
+    #
+    # The detector was keyed almost entirely on IMPERATIVES, and measured
+    # accordingly: it fired on two prompts that were instructions, and missed
+    # all three genuine corrections. Those three arrived as disagreement, which
+    # is how corrections usually arrive — a person who thinks you are wrong
+    # says so, they do not issue you an order.
+    #
+    # All three shapes point BACKWARD at something already said, which is what
+    # separates a correction from a task. Kept as flat patterns with fixtures,
+    # per the standing rule that this stays a cheap classifier.
+
+    # "that's wrong" / "that's not right" / "that isn't correct" / "this is wrong"
+    re.compile(
+        r"\b(?:that|this|it)(?:'?s|\s+is|\s+was)?\s*(?:n[o']?t\s+)?"
+        r"(?:wrong|incorrect|inaccurate|backwards|mistaken)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:that|this|it)(?:'?s|\s+is)\s+not\s+(?:right|correct|true|accurate)\b",
+        re.IGNORECASE,
+    ),
+    # "you're confusing X with Y" / "you've mixed up" / "you're conflating"
+    re.compile(
+        r"\byou(?:'?re|\s+are|'?ve|\s+have)\s+"
+        r"(?:confus(?:ing|ed)|mix(?:ing|ed)\s+up|conflat(?:ing|ed)|"
+        r"misread(?:ing)?|misremember(?:ing|ed))\b",
+        re.IGNORECASE,
+    ),
+    # Temporal invalidation — the fact was right once and is not right now.
+    # "that was true last month", "that's out of date", "not anymore",
+    # "we changed that", "that's no longer the case".
+    re.compile(
+        r"\b(?:that|this|it)\s+(?:was|used\s+to\s+be)\s+"
+        r"(?:true|right|correct|the\s+case)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:out\s+of\s+date|no\s+longer\s+(?:true|correct|the\s+case|applies))\b",
+        re.IGNORECASE,
+    ),
+    # "that's not what I said/meant/asked for" / "I never said"
+    re.compile(
+        r"\b(?:that'?s\s+not\s+what\s+i\b|i\s+never\s+(?:said|asked|told))",
+        re.IGNORECASE,
+    ),
+)
+
+
+# A prompt that OPENS by assigning the assistant a role, or by framing a task,
+# is a task — however many negation imperatives it goes on to contain.
+#
+# This is the false-positive class the benchmark exposed (2026-08-07). Both
+# fires came from the harness's own instruction prompts, e.g.
+#
+#   "You have persistent memory of a prior multi-session conversation ...
+#    Before answering you MUST consult your memory ... Do NOT answer from the
+#    index alone, and do NOT abstain before actually reading the files ..."
+#
+# `Do NOT answer` is a clause-initial negation imperative, so it matched — but
+# it is an instruction about the task ahead, not a correction of anything the
+# assistant did. Corrections point backward; task setups point forward. This
+# is deliberately narrow: it keys on how the prompt OPENS, so an ordinary
+# correction that happens to contain "you are" mid-sentence is unaffected.
+TASK_FRAMING_OPENERS: tuple[re.Pattern, ...] = tuple(
+    re.compile(p, re.IGNORECASE) for p in (
+        r"^\s*you\s+are\s+(?:an?|the)\s+\w+",
+        r"^\s*you\s+have\s+(?:persistent|access\s+to|been\s+given)\b",
+        r"^\s*your\s+task\s+is\b",
+        r"^\s*below\s+is\b",
+        r"^\s*answer\s+the\s+(?:question|following)\b",
+        r"^\s*(?:earlier|prior|previous)\s+sessions?\s+with\s+you\b",
+    )
 )
 
 
@@ -116,12 +189,14 @@ NON_CORRECTION_PREFIX_BLACKLIST: tuple[str, ...] = (
 def is_operator_correction(prompt: str) -> bool:
     """True iff the prompt looks like an operator correction.
 
-    Two-stage gate:
+    Three-stage gate:
       1. Blacklist check — Claude Code internal events (task notifications,
          system reminders, etc.) are NEVER corrections regardless of what
          text they contain.
-      2. Pattern match — high-precision correction markers (PATCH-189
-         refined; see module docstring for evidence trail).
+      2. Task-framing check (2026-08-07) — a prompt that OPENS by assigning a
+         role or framing a task is a task, however many imperatives follow.
+      3. Pattern match — correction markers, imperative AND disagreement
+         shapes (see the pattern table for the evidence behind each).
 
     Mirrors server-side `dispatch_tools._is_operator_correction`.
     """
@@ -129,5 +204,7 @@ def is_operator_correction(prompt: str) -> bool:
         return False
     p_lstrip = prompt.lstrip()
     if any(p_lstrip.startswith(prefix) for prefix in NON_CORRECTION_PREFIX_BLACKLIST):
+        return False
+    if any(p.search(p_lstrip) for p in TASK_FRAMING_OPENERS):
         return False
     return any(p.search(prompt) for p in CORRECTION_PATTERNS)

@@ -21,6 +21,7 @@ Stop hook integration:
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -150,6 +151,10 @@ def tend(memory_dir: Path, known_projects: list[str] | None = None) -> dict:
     return {
         "memory_dir": str(memory_dir),
         "tier_audit": audit,
+        # Prefixed/unprefixed leaf pairs about one subject, flagged by the
+        # SessionStart reconcile. Both stay indexed and both stay on disk;
+        # merging them is a human call, which is why they surface here.
+        "convention_pairs": read_convention_pairs(memory_dir),
         "retiring_rules": [
             {
                 "rule_id": s.rule_id,
@@ -255,6 +260,304 @@ def list_orphans(memory_dir: Path) -> list[str]:
         if p.name not in referenced:
             orphans.append(p.name)
     return sorted(orphans)
+
+
+# ---------- orphan self-healing (2026-08-07) ----------
+#
+# A written leaf must be reachable. That was agent discipline — write the file,
+# remember to add the index line — and discipline lost: a normal 19-session
+# ingest produced four leaves and indexed two, having switched naming convention
+# partway (`caroline-profile.md` -> `project_caroline.md`) and abandoned the
+# originals holding sessions 1-3.
+#
+# The cost isn't the two missing lines. An index is read as an exhaustive
+# inventory, so a partial index actively SUPPRESSES discovery of what it omits:
+# the benchmark arm given the partial index scored 0.40 where the arm given no
+# index at all scored 0.52, because the second one explored the directory and
+# found the orphans while the first trusted the list and stopped. Strictly worse
+# than no index.
+#
+# So reachability becomes mechanical. Every session start, before the index is
+# injected, unindexed leaves are appended to their section. Append-only: no
+# existing line is rewritten or reordered, no leaf is moved or deleted.
+
+_RECONCILE_DESCRIPTION_CAP = 150
+_CONVENTION_PAIRS_RELPATH = ("_processed", "convention_pairs.json")
+
+# Never indexed: the index itself and README prose. Must stay in step with
+# `list_orphans`'s own exclusions — a file one of them skips and the other
+# reports is a permanent orphan, which would pin the "index may be incomplete"
+# warning on forever and teach the reader to ignore it. `_PURPOSE.md` is
+# deliberately NOT here: it is a real memory leaf and belongs in the index.
+_RECONCILE_SKIP_NAMES = frozenset({"MEMORY.md", "README.md"})
+
+# Frontmatter `type` -> section, for leaves with no filename prefix. Anything
+# else (including `user`) lands in Project, per the same default the scaffold
+# template teaches.
+_TYPE_TO_SECTION = {
+    "feedback": "Feedback",
+    "project": "Project",
+    "reference": "Reference",
+}
+
+
+def _declared_type(text: str) -> str:
+    """The leaf's declared `type`, read from frontmatter at ANY indentation.
+
+    The documented schema nests it (`metadata:` / `  type: project`), so a
+    column-0-only read — which is what the destructive paths correctly use —
+    finds nothing and every typed leaf routes to the default. Scoped to the
+    frontmatter block, so a prose mention still can't be mistaken for a
+    declaration.
+    """
+    span = apoptotic_retirement._frontmatter_slice(text)
+    if span is None:
+        return ""
+    m = re.search(r"^[ \t]*type:\s*(.+?)\s*$", text[span[0]:span[1]], re.MULTILINE)
+    return m.group(1).strip().strip("'\"").lower() if m else ""
+
+
+def _reconcile_section_for(path: Path, text: str) -> str:
+    """Section for an orphan leaf: filename prefix first, then frontmatter
+    `type`, else Project."""
+    section = _section_for_filename(path.name)
+    if section != "Other":
+        return section
+    return _TYPE_TO_SECTION.get(_declared_type(text), "Project")
+
+
+def _stem_tokens(fname: str) -> list[str]:
+    """Filename reduced to comparable tokens, with any section prefix removed.
+
+    `project_caroline.md` and `caroline-profile.md` both start at `caroline`,
+    which is what makes them recognizable as one subject split across a
+    convention change.
+    """
+    stem = fname[:-3] if fname.lower().endswith(".md") else fname
+    lower = stem.lower()
+    for prefix in ("feedback_", "project_", "reference_"):
+        if lower.startswith(prefix):
+            lower = lower[len(prefix):]
+            break
+    return [t for t in re.split(r"[-_\s]+", lower) if t]
+
+
+def _find_convention_pairs(memory_dir: Path, live_names: list[str]) -> list[dict]:
+    """Prefixed/unprefixed leaf pairs about the same subject.
+
+    A pair is two live leaves that differ in whether they carry a section
+    prefix, where one's token list starts the other's AND the two differ by at
+    most one token. Both stay indexed and both stay on disk — this only flags
+    them for `/allostat-tend`, where merging is human-gated.
+
+    The one-token bound is not arbitrary. Run against a real 423-file tree,
+    a bare prefix relation flagged `project_allostat.md` with
+    `allostat-mcp-installer-fix-brief.md` and `feedback_purpose_over_expediency.md`
+    with `_PURPOSE.md` — a shared first word is not a shared subject, and a
+    tend report full of coincidences is a tend report nobody reads. A real
+    convention change adds a qualifier: `project_caroline.md` /
+    `caroline-profile.md`, one token apart.
+
+    Machinery files (leading `_`) are excluded: they are not subject leaves and
+    can never be the other half of a rename.
+    """
+    prefixed = [n for n in live_names if _section_for_filename(n) != "Other"]
+    bare = [
+        n for n in live_names
+        if _section_for_filename(n) == "Other" and not n.startswith("_")
+    ]
+    pairs: list[dict] = []
+    for p in prefixed:
+        p_tokens = _stem_tokens(p)
+        if not p_tokens:
+            continue
+        for b in bare:
+            b_tokens = _stem_tokens(b)
+            if not b_tokens:
+                continue
+            shorter, longer = sorted((p_tokens, b_tokens), key=len)
+            if len(longer) - len(shorter) > 1:
+                continue
+            if longer[: len(shorter)] == shorter:
+                pairs.append({
+                    "prefixed": p,
+                    "unprefixed": b,
+                    "shared_stem": " ".join(shorter),
+                    "reason": "naming_convention_change",
+                })
+    return pairs
+
+
+def reconcile_orphans(memory_dir: Path) -> dict:
+    """Append an index line for every live leaf MEMORY.md doesn't name.
+
+    Runs at SessionStart before the index is injected, so what reaches the
+    agent names everything on disk. Append-only and non-destructive:
+
+      - existing index lines are never rewritten, reordered, or removed
+      - leaf files are never moved, renamed, or deleted (archiving is
+        /allostat-prune's job and stays human-gated)
+      - cold storage, handoffs, silos, `_processed/`, dotfiles and empty files
+        are not leaves and are not indexed
+      - a missing section header is appended before its first entry; existing
+        section bodies take the new line at their end
+
+    Returns {"scanned", "indexed", "failed", "sections", "pairs", "ok"}.
+    Best-effort throughout: a tree that can't be read returns a report saying
+    so rather than raising into the hook.
+    """
+    report = {"scanned": 0, "indexed": [], "failed": [], "sections": {},
+              "pairs": [], "ok": False}
+    if not memory_dir.is_dir():
+        return report
+
+    index = memory_dir / "MEMORY.md"
+    orphan_names = set(list_orphans(memory_dir))
+    report["scanned"] = len(orphan_names)
+
+    live_names: list[str] = []
+    for p in memory_dir.rglob("*.md"):
+        if _is_cold_storage(memory_dir, p) or p.name in _RECONCILE_SKIP_NAMES:
+            continue
+        if not p.name.startswith("."):
+            live_names.append(p.name)
+    report["pairs"] = _find_convention_pairs(memory_dir, sorted(set(live_names)))
+
+    if not orphan_names:
+        report["ok"] = True
+        _write_convention_pairs(memory_dir, report["pairs"])
+        return report
+
+    # (section, entry_line) for each orphan we can actually describe.
+    additions: list[tuple[str, str]] = []
+    for p in sorted(memory_dir.rglob("*.md")):
+        if p.name not in orphan_names:
+            continue
+        if p.name in _RECONCILE_SKIP_NAMES or p.name.startswith("."):
+            continue
+        if _is_cold_storage(memory_dir, p):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            report["failed"].append(p.name)
+            continue
+        if not text.strip():
+            # An empty file is not yet a memory. Skipped, not failed — it
+            # gets indexed on the session after it has content.
+            continue
+        try:
+            rel = p.relative_to(memory_dir).as_posix()
+        except ValueError:
+            report["failed"].append(p.name)
+            continue
+        description = _extract_description(text)
+        if len(description) > _RECONCILE_DESCRIPTION_CAP:
+            description = description[:_RECONCILE_DESCRIPTION_CAP].rstrip() + "..."
+        title = p.name[:-3].replace("_", " ").replace("-", " ").title()
+        additions.append((
+            _reconcile_section_for(p, text),
+            f"- [{title}]({rel}) — {description}",
+        ))
+
+    if not additions:
+        report["ok"] = True
+        _write_convention_pairs(memory_dir, report["pairs"])
+        return report
+
+    try:
+        original = index.read_text(encoding="utf-8", errors="replace") if index.exists() else ""
+    except OSError as e:
+        report["failed"].append(f"MEMORY.md: {e}")
+        return report
+
+    lines = original.splitlines()
+    for section, entry in additions:
+        lines = _append_entry_to_section(lines, section, entry)
+        report["indexed"].append(entry)
+        report["sections"][section] = report["sections"].get(section, 0) + 1
+
+    new_text = "\n".join(lines)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    try:
+        index.write_text(new_text, encoding="utf-8")
+        report["ok"] = True
+    except OSError as e:
+        report["failed"].append(f"MEMORY.md: {e}")
+    _write_convention_pairs(memory_dir, report["pairs"])
+    return report
+
+
+def _append_entry_to_section(lines: list[str], section: str, entry: str) -> list[str]:
+    """Insert `entry` at the END of `section`'s body, creating the section if
+    absent. Existing lines keep their order and their text."""
+    header_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("## ") or stripped.startswith("### "):
+            continue
+        heading = stripped[3:].strip()
+        if heading == section or heading.startswith(section + " ") or heading.startswith(section + "("):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        out = list(lines)
+        if out and out[-1].strip():
+            out.append("")
+        out.append(f"## {section}")
+        out.append("")
+        out.append(entry)
+        return out
+
+    # Last non-blank line before the next `## ` header (or EOF).
+    end = len(lines)
+    for j in range(header_idx + 1, len(lines)):
+        nxt = lines[j].lstrip()
+        if nxt.startswith("## ") and not nxt.startswith("### "):
+            end = j
+            break
+    insert_at = end
+    while insert_at > header_idx + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    return lines[:insert_at] + [entry] + lines[insert_at:]
+
+
+def _write_convention_pairs(memory_dir: Path, pairs: list[dict]) -> None:
+    """Persist convention-change pairs for `/allostat-tend` to surface.
+
+    Supersede semantics, and deliberately NOT the merge queue: that file is
+    overwritten wholesale by the Stop-hook detector, which would erase these.
+    """
+    import json as _json
+    target = memory_dir.joinpath(*_CONVENTION_PAIRS_RELPATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            _json.dumps({"count": len(pairs), "pairs": pairs}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Best-effort: these pairs are a HINT for /allostat-tend, not a record
+        # anything depends on. Both files stay indexed and both stay on disk
+        # either way, so a failed write loses a suggestion, not a memory — and
+        # the next session start recomputes it from scratch.
+        pass
+
+
+def read_convention_pairs(memory_dir: Path) -> list[dict]:
+    """Read the flagged convention-change pairs. [] on missing/corrupt file."""
+    import json as _json
+    target = memory_dir.joinpath(*_CONVENTION_PAIRS_RELPATH)
+    if not target.is_file():
+        return []
+    try:
+        data = _json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    return pairs if isinstance(pairs, list) else []
 
 
 def reorder_memory_md(memory_dir: Path, by: str = "age") -> dict:
@@ -916,6 +1219,18 @@ def format_tend_report(report: dict) -> str:
                 f"  {r['rule_id']:50s} sessions_remaining={r['sessions_remaining']}  "
                 f"priority={r['retrieval_priority_multiplier']:.2f}"
             )
+
+    pairs = report.get("convention_pairs", [])
+    if pairs:
+        lines.append(f"")
+        lines.append(
+            f"Naming-convention pairs ({len(pairs)}) — one subject, two files, "
+            f"both indexed. Merge is your call:"
+        )
+        for p in pairs[:20]:
+            lines.append(f"  {p.get('prefixed', '?')}  <->  {p.get('unprefixed', '?')}")
+        if len(pairs) > 20:
+            lines.append(f"  ... + {len(pairs) - 20} more")
 
     awaiting = report.get("awaiting_finalization", [])
     if awaiting:

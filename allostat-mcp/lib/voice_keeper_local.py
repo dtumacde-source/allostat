@@ -554,6 +554,17 @@ def _inscribe_voice_violations(
 ) -> int:
     """Inscribe one silos/voice.jsonl entry per detected violation.
 
+    2026-08-07 — these rows are DETECTIONS, and they now say so. Until this
+    date every one of them was written with `success_marker="voice_corrected"`
+    while nothing was surfaced to the operator and nothing was corrected; the
+    bench VM's 17 unsurfaced violations produced 17 rows all claiming a
+    correction had occurred. Anything reading the silo as a record of what the
+    operator taught was reading fiction, and getting more confident about it
+    over time. The path now calls `record_voice_detection`, and
+    `voice_corrected` has exactly one gated way in
+    (`silos.voice.record_voice_correction`, which requires evidence the
+    correction was surfaced).
+
     PATCH-195 (2026-05-24) — wrapper-direct voice silo inscribe. Called
     from evaluate_and_record after observation append. Mirrors PATCH-194
     drift inscribe semantic: heuristic auto-inscribe of the detected
@@ -579,7 +590,7 @@ def _inscribe_voice_violations(
         from silos.voice import (  # noqa: E402
             VoiceFingerprint,
             VoiceResolution,
-            record_voice_resolution,
+            record_voice_detection,
         )
         from silo_base import resolve_silo_path  # noqa: E402
     except ImportError:
@@ -606,7 +617,7 @@ def _inscribe_voice_violations(
             canonical_source="voice_keeper_auto_detection",
         )
         try:
-            record_voice_resolution(
+            record_voice_detection(
                 silo_path,
                 fingerprint,
                 resolution,

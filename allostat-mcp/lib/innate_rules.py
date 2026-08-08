@@ -1216,6 +1216,108 @@ def _destructive_guard_status() -> tuple[bool, str, bool]:
     ), True
 
 
+_SESSION_SCRIPT_MESSAGE = """\
+⛔ RUNNING A SCRIPT THIS SESSION WROTE — innate-02 fired
+
+Command: {command}
+Script:  {script}
+
+Why this fired: innate-02 reads the command it is given. This command runs a
+file that was written or modified earlier in THIS session, so what actually
+executes is text the guard never saw. A script containing `rm -rf` over four
+paths runs unguarded; the same `rm -rf` typed inline is refused. The only
+difference is indirection, and the blast radius is identical.
+
+How to proceed:
+
+  Type `allostat: override` in your next message to authorize THIS one
+  command. Consent is single-use — the guard re-arms immediately after.
+
+  Or read the script back first. If it does nothing destructive, that is a
+  five-second check; if it does, this box just earned its keep.
+
+LIMITATION, stated plainly: this covers scripts written in the SAME session.
+It does not and cannot cover indirection in general — a pre-existing script, a
+`curl | sh`, a base64 payload, a Makefile target, an `eval`. String matching at
+PreToolUse cannot see through arbitrary indirection. This guard is a seatbelt,
+not a sandbox, and it should not be trusted as one.
+
+The override is logged to .allostat/observations.jsonl as
+innate_rule_overridden — forensics preserved either way.
+"""
+
+# Interpreters whose argument is a program to run, not data to read.
+_SCRIPT_INTERPRETERS = (
+    "bash", "sh", "zsh", "ksh", "dash", "fish",
+    "python", "python3", "py", "perl", "ruby", "node", "deno",
+    "powershell", "pwsh", "cmd", "source",
+)
+
+
+def session_written_script_match(
+    command: str | None,
+    session_written_paths: set[str] | frozenset[str] | None,
+) -> "InnateRuleMatch | None":
+    """innate-02 for the ISSUE-005 class: executing a script this session wrote.
+
+    Measured on the bench VM, minutes apart in one session, identical blast
+    radius: `bash /tmp/cl.sh` (the script held `rm -rf` over four paths) ran
+    unguarded, while `rm -rf ~/.claude/projects/-tmp` inline was blocked and
+    demanded an override. The only difference is whether the destructive text
+    appears in the command string the hook receives.
+
+    Worth being precise about why this matters: it was not an evasion attempt.
+    The agent had been moving shell into script files all session because
+    PowerShell mangled WSL quoting. So the bypass sits on the ORDINARY path for
+    anyone working Windows->WSL — the guard silently degrades to advisory
+    exactly when an agent does the normal thing.
+
+    SCOPE, deliberately narrow: a file written or modified earlier in the same
+    session, executed by an interpreter. General indirection analysis is not
+    attempted and is documented as out of reach (see the message text) rather
+    than half-built — a guard trusted beyond its coverage is worse than one
+    whose limits are written down.
+
+    Returns None when nothing matches, so callers can chain it.
+    """
+    if not command or not session_written_paths:
+        return None
+
+    lowered = command.lower()
+    for raw in session_written_paths:
+        if not raw:
+            continue
+        candidate = str(raw).replace("\\", "/")
+        basename = candidate.rsplit("/", 1)[-1]
+        if not basename:
+            continue
+        # The path (or its basename) must appear AND an interpreter must be
+        # invoking something — `cat /tmp/cl.sh` and `rm /tmp/cl.sh` are not
+        # executions and must not fire a lethal gate.
+        if candidate.lower() not in lowered and basename.lower() not in lowered:
+            continue
+        if not any(
+            re.search(rf"(?:^|[\s;&|`(]){re.escape(exe)}(?:\.exe)?\s", command, re.IGNORECASE)
+            for exe in _SCRIPT_INTERPRETERS
+        ) and not re.search(
+            rf"(?:^|[\s;&|`(])\.?/?{re.escape(basename)}\b", command
+        ):
+            continue
+        overrides_active = _parse_overrides_set(_os_environ_overrides())
+        return InnateRuleMatch(
+            rule_id=DESTRUCTIVE_RULE_ID,
+            rule_name="Executing a script written earlier this session",
+            severity="lethal",
+            response_action="hard_pause",
+            formatted_message=_SESSION_SCRIPT_MESSAGE.format(
+                command=(command or "")[:500],
+                script=candidate,
+            ),
+            overridden=("*" in overrides_active or DESTRUCTIVE_RULE_ID in overrides_active),
+        )
+    return None
+
+
 def _degraded_destructive_fallback(command: str | None) -> "InnateRuleMatch | None":
     """Refusal for a destructive command when the destructive rule is unavailable.
 

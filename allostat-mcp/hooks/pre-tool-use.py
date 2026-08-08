@@ -2826,6 +2826,26 @@ def _main() -> int:
             context_flags=set(context_flags),
             sibling_list=sibling_list,
         )
+        # ISSUE-005 (2026-08-07): the pattern set above reads the command
+        # string, so `bash /tmp/cl.sh` says nothing about the `rm -rf` inside
+        # the script. Checked only when nothing already fired — this adds
+        # coverage, it never overrides a rule that matched on its own evidence.
+        # Its own try/except: a bookkeeping failure here must not route into
+        # _innate_evaluator_failed and start refusing ordinary commands.
+        if innate_match is None and command:
+            try:
+                from innate_rules import session_written_script_match  # noqa: E402
+                from session_script_tracker import read_written  # noqa: E402
+
+                innate_match = session_written_script_match(
+                    command,
+                    set(read_written(
+                        state_dir,
+                        payload.get("session_id") or payload.get("sessionId"),
+                    )),
+                )
+            except Exception as script_err:  # noqa: BLE001
+                emit_stderr(f"session-script check failed: {script_err}")
         # 2026-08-02 — a dropped rule must not be a silent rule. The gate in
         # _build_working_set removes any edited/duplicate/unknown rule with
         # one logger.warning nothing renders on ALLOWED calls, and the loud

@@ -61,7 +61,12 @@ TARGET_MODES: dict[str, frozenset[str]] = {
     "nudge_history.jsonl": frozenset({"append"}),
     "pending_proposals.jsonl": frozenset({"append"}),
     "pillar_history.jsonl": frozenset({"append"}),
-    "silo_entry.jsonl": frozenset({"append"}),
+    # "purge" (2026-08-07): the retraction path. The server can INSTRUCT a
+    # purge but never performs one — silo bytes are operator-local by the
+    # privacy moat, so the client removes them and the client verifies. It is
+    # the only non-append mode on a JSONL target, and it exists because
+    # "forget X" that leaves the silo intact is a false claim.
+    "silo_entry.jsonl": frozenset({"append", "purge"}),
     "epigenetic_signature.json": frozenset({"overwrite", "merge"}),
     "prediction_calibration.json": frozenset({"overwrite", "merge"}),
     "chronic_stress_baseline.json": frozenset({"overwrite", "merge"}),
@@ -177,6 +182,10 @@ def _apply_one(
             _write_json(target_path, content)
         elif mode == "merge":
             _merge_json(target_path, content)
+        elif mode == "purge":
+            ok, reason = _purge_silo(target_path, content)
+            if not ok:
+                return False, reason
         else:
             # Defensive: should be unreachable given the allowed_modes check.
             return False, f"mode_handler_missing:{mode!r}"
@@ -306,7 +315,8 @@ def _append_jsonl(path: Path, content: dict[str, Any]) -> None:
     # whitelist fields only (resolution: canonical_source; fingerprint:
     # class_name + key_tokens). Non-whitelist canonical fields bind to
     # wrapper-local canonical_resolutions.jsonl before the strip + write.
-    if path.parent.name == "silos" and path.suffix == ".jsonl":
+    is_silo = path.parent.name == "silos" and path.suffix == ".jsonl"
+    if is_silo:
         # State_dir for canonical_resolutions bind: silos/ parent.
         _bind_canonical_from_silo_content(path.parent.parent, content)
         content = _strip_canonical_from_silo_content(content)
@@ -322,8 +332,22 @@ def _append_jsonl(path: Path, content: dict[str, Any]) -> None:
     except ImportError:
         _lock_cm = contextlib.nullcontext()
     with _lock_cm:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        # Dedup fix (2026-08-07): the server-dispatched inscribe folds onto an
+        # existing case exactly like the wrapper-direct one
+        # (silo_base.write_entry) — one case, one row, a rising fire_count.
+        # Two write paths into the same file must agree about what a row means.
+        # Best-effort: a degraded install without silo_base still appends.
+        coalesced = False
+        if is_silo:
+            try:
+                from silo_base import coalesce_or_append
+                coalesce_or_append(path, content)
+                coalesced = True
+            except ImportError:
+                coalesced = False
+        if not coalesced:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
     # PATCH-144 v1.2.0 — rotate when file crosses threshold. Audit D1 fix.
     # Best-effort; silent on filesystem error.
     try:
@@ -349,6 +373,44 @@ def _append_jsonl(path: Path, content: dict[str, Any]) -> None:
         # absent in a degraded install). Logic errors now PROPAGATE — a bug
         # in rotation must surface to the hook crash armor, not vanish.
         pass
+
+
+def _purge_silo(path: Path, content: dict[str, Any]) -> tuple[bool, str | None]:
+    """Remove every row of a silo matching `content["pattern"]`, then VERIFY.
+
+    The client does the removing because the client is where the bytes are —
+    the server has never held silo content and must not start in order to
+    delete it. It also does the verifying: a purge that reports success without
+    re-reading the file is the same false claim, one layer down.
+
+    Returns (False, reason) if anything still matches afterwards, so the write
+    is audited as rejected rather than logged as applied.
+    """
+    pattern = content.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return False, "purge_missing_pattern"
+    if not path.is_file():
+        return True, None  # nothing to purge is not a failure
+
+    import re as _re
+
+    rx = _re.compile(_re.escape(pattern), _re.IGNORECASE)
+    try:
+        from local_state import jsonl_lock
+        lock_cm = jsonl_lock(path)
+    except ImportError:
+        lock_cm = contextlib.nullcontext()
+    with lock_cm:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        kept = [ln for ln in lines if not rx.search(ln)]
+        if len(kept) != len(lines):
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        survivors = sum(
+            1 for ln in path.read_text(encoding="utf-8").splitlines() if rx.search(ln)
+        )
+    if survivors:
+        return False, f"purge_incomplete:{survivors}_rows_remain"
+    return True, None
 
 
 def _write_json(path: Path, content: dict[str, Any]) -> None:
