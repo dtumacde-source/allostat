@@ -1,6 +1,6 @@
 {
   "name": "allostat-mcp",
-  "version": "1.4.85",
+  "version": "1.4.86",
   "description": "Allostat \u2014 allostatic regulator for AI agents. Autonomic memory governance, drift correction, and operator-state integration. Fires via hooks; no agent invocation required.",
   "_version_history_pre_1_3_3": "v1.0.0 shipped full v2.3 memory architecture parity. v1.1.0 prunes session-start surface area per advisor v2.5.0 scoping (PATCH-140). v1.1.1 adds UserPromptSubmit chrome suppression on interrupt-override prompts (PATCH-141). v1.2.0 lands three audit-driven critical fixes: PATCH-142 sandbox_perms config-loader refactor; PATCH-143 innate rules wrapper-local evaluation; PATCH-144 JSONL rotation discipline. v1.3.0 lands PATCH-147a / Phase 3.3 (/allostat-promote-to-prod), PATCH-149 (session_id wiring), PATCH-150 (leading-word interrupt detection), PATCH-160 (placeholder sync), PATCH-161 (rule-name reconciliation). v1.3.1: PATCH-162 closes constant-stub family at dispatcher level. v1.3.2: PATCH-163 dusk-persist debounce + PATCH-164 operator_correction observation persistence. v1.3.3 (this version): PATCH-168 closes the orientation-loss handoff bug (path mismatch + signal-phrase gate + content-free body \u2014 every session left no usable handoff; next session opened uninformed); PATCH-146 closes the recurring advisor-session sandbox block via CLAUDE.md frontmatter role auto-discovery.",
   "author": {

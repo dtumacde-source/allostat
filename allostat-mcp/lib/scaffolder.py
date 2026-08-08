@@ -62,6 +62,10 @@ This is the project memory tree for sessions opened from this cwd. Allostat auto
 
 Each section below holds feedback / project / reference files Claude has learned about your workflow. Lines stay under 150 chars (auto-enforced by Allostat).
 
+Claude: THIS tree — not Claude Code's built-in `~/.claude` memory — is where this project's memory lives. To remember something for future
+sessions, write a leaf file in this folder (`feedback_*.md` / `project_*.md` / `reference_*.md`) and add a one-line entry for it in the
+matching section below. Allostat injects this index at every session start, so anything indexed here is found again next session.
+
 ## Feedback
 
 (Feedback files document corrections you've given Claude. Add entries as Claude learns your preferences.)
@@ -114,6 +118,75 @@ This folder is the confidential sandbox for {project_name} — a place for advis
 
 Per-session work lives in `YYYYMMDD_session##_advisor.md` files alongside this README. Date-first so files sort chronologically; session number zero-padded for multi-session days.
 """
+
+
+def is_adoptable_project_root(
+    project_root: Path,
+    *,
+    home: Path | None = None,
+    tempdirs: list[str] | None = None,
+) -> bool:
+    """Conservative adoption gate (2026-08-07, reliable-memory run).
+
+    Registration is QUIET and AUTOMATIC — no interview, no questions — so
+    the only protection against planting memory trees where they rot is
+    this predicate. It refuses exactly the known-toxic root classes:
+
+    - $HOME itself (a session opened from `~` is not a project),
+    - filesystem/drive roots (`C:\\`, `/`),
+    - temp trees (OS tempdir + TEMP/TMP/TMPDIR) — scratch dirs vanish,
+    - anything under `~/.claude` — the harness namespace; scaffolding there
+      recreates the 2026-08-03 orphan-tree class (a parallel memory tree
+      the banner later reads as fact).
+
+    Everything else is adoptable, including $HOME subdirectories and
+    plain non-git folders: the product promise is that a real project dir
+    just works with zero setup. Guards only what provably rots.
+
+    This gates SCAFFOLDING (tree creation), never reading: an existing
+    populated tree is always served wherever it lives. `.allostat/` state
+    is also not gated — entitlement caching must work even in refused
+    roots so regulation still functions there.
+
+    `home`/`tempdirs` are injectable for tests. The env override
+    `ALLOSTAT_ADOPTION_TEMPDIR_OVERRIDE` replaces the computed tempdir set
+    so subprocess-level tests can exercise both verdicts from inside a
+    pytest tmp_path (which IS a real tempdir); it can only ever widen
+    adoption of temp scratch — never entitlement, never memory reads.
+    """
+    import tempfile
+    try:
+        root = Path(project_root).resolve()
+    except (OSError, ValueError):
+        return False
+    home_dir = Path(home).resolve() if home is not None else Path.home().resolve()
+    if root == home_dir:
+        return False
+    if root.parent == root:
+        return False
+    claude_home = home_dir / ".claude"
+    if root == claude_home or claude_home in root.parents:
+        return False
+    if tempdirs is None:
+        override = os.environ.get("ALLOSTAT_ADOPTION_TEMPDIR_OVERRIDE")
+        if override:
+            candidates = {override}
+        else:
+            candidates = {
+                tempfile.gettempdir(),
+                os.environ.get("TEMP"),
+                os.environ.get("TMP"),
+                os.environ.get("TMPDIR"),
+            }
+        tempdirs = [c for c in candidates if c]
+    for td in tempdirs:
+        try:
+            t = Path(td).resolve()
+        except (OSError, ValueError):
+            continue
+        if root == t or t in root.parents:
+            return False
+    return True
 
 
 def compute_memory_dir_path(project_root: Path | None = None) -> Path:

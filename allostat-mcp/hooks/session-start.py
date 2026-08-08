@@ -1481,6 +1481,52 @@ def _main() -> int:
     except Exception as e:
         emit_stderr(f"memory_lifecycle tick failed: {e}")
 
+    # Reliable-memory session-1 fix (2026-08-07): scaffold a brand-new
+    # project's memory tree BEFORE the index injects, so the VERY FIRST
+    # session already gets the template index — which teaches the agent that
+    # Allostat memory exists, where it lives, and how to write to it. The
+    # old ordering scaffolded after the inject: session 1 of every new
+    # project injected nothing, the agent was never told about the tree,
+    # and "remember this" fell through to Claude Code's native memory.
+    #
+    # Gated on conservative adoption (scaffolder.is_adoptable_project_root):
+    # quiet auto-registration must never plant trees in $HOME, temp dirs,
+    # drive roots, or the harness namespace (the 2026-08-03 orphan class).
+    # Refusal is observable, never silent. NEVER overwrites existing files.
+    if project_root is not None:
+        try:
+            import scaffolder  # noqa: E402
+            if scaffolder.is_adoptable_project_root(project_root):
+                tier4_actions: list = []
+                expected_mem_dir = scaffolder.compute_memory_dir_path(project_root)
+                if not expected_mem_dir.is_dir():
+                    tier4_actions.extend(
+                        scaffolder.scaffold_project_memory_tree(project_root)
+                    )
+                tier4_actions.extend(
+                    scaffolder.scaffold_project_sandbox(project_root)
+                )
+                if state_dir is not None and tier4_actions:
+                    try:
+                        append_observation(state_dir, "project_scaffolder_run", details={
+                            "project_root": str(project_root),
+                            "actions_count": len(tier4_actions),
+                            "tier4_created": sum(1 for a in tier4_actions if a.kind == "tier4_created"),
+                            "tier3_created": sum(1 for a in tier4_actions if a.kind == "tier3_created"),
+                        })
+                    except Exception:
+                        pass
+            elif state_dir is not None:
+                try:
+                    append_observation(state_dir, "memory_scaffold_refused", details={
+                        "project_root": str(project_root),
+                        "reason": "unadoptable_root (home/temp/drive-root/harness-namespace)",
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            emit_stderr(f"project scaffolder failed: {e}")
+
     # Workstream C (R3): root memory in <project>/memory/ BEFORE the index
     # injects — reconcile the legacy harness tree in (newest-wins, archive-not-
     # destroy), then regenerate the harness MEMORY.md as a thin pointer. Must
@@ -1517,39 +1563,11 @@ def _main() -> int:
     except Exception as e:
         emit_stderr(f"scaffolder failed: {e}")
 
-    # PATCH-D / Tier 4 — per-project memory tree + sandbox scaffolder.
-    # Fires when project_root resolves and the memory tree directory is
-    # absent (first-cwd-seen detector). Auto-scaffolds memory dir +
-    # MEMORY.md header template + _PURPOSE.md template + sandbox folder
-    # with README. NEVER overwrites existing files. Best-effort.
-    if project_root is not None:
-        # (Memory reconcile + harness-pointer regen now run in
-        # _root_project_memory ABOVE, before the index injects — Workstream C
-        # / council Fork 3. The Tier-4 scaffolder below still creates a fresh
-        # in-project tree for a brand-new project.)
-        try:
-            import scaffolder  # noqa: E402
-            expected_mem_dir = scaffolder.compute_memory_dir_path(project_root)
-            tier4_actions: list = []
-            if not expected_mem_dir.is_dir():
-                tier4_actions.extend(
-                    scaffolder.scaffold_project_memory_tree(project_root)
-                )
-            tier4_actions.extend(
-                scaffolder.scaffold_project_sandbox(project_root)
-            )
-            if state_dir is not None and tier4_actions:
-                try:
-                    append_observation(state_dir, "project_scaffolder_run", details={
-                        "project_root": str(project_root),
-                        "actions_count": len(tier4_actions),
-                        "tier4_created": sum(1 for a in tier4_actions if a.kind == "tier4_created"),
-                        "tier3_created": sum(1 for a in tier4_actions if a.kind == "tier3_created"),
-                    })
-                except Exception:
-                    pass
-        except Exception as e:
-            emit_stderr(f"project scaffolder failed: {e}")
+    # (PATCH-D / Tier 4 per-project memory tree + sandbox scaffolder now runs
+    # ABOVE, before _root_project_memory + _inject_project_memory — the
+    # reliable-memory session-1 fix, 2026-08-07 — behind the conservative
+    # adoption gate. A brand-new project's first session injects the fresh
+    # template index instead of injecting nothing.)
 
     # PATCH-MIGRATE — verify scaffolding completed + write migration marker.
     # Idempotent via ~/.allostat/.migration_complete marker. Distinct from

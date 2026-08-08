@@ -104,9 +104,14 @@ Tips cycle with cooldown — you won't see the same tip twice within 7 days (or 
 
 1. Confirm Claude Code restarted after installation.
 2. Check `~/.claude/settings.json` has `"allostat-mcp@local": true` under `enabledPlugins`.
-3. Run the session-start hook manually to see what it would emit:
+3. Make sure a Python 3 interpreter is on PATH (`python3 --version` or
+   `python --version`). Hooks run through `hooks/run_hook`, which resolves
+   `python3` then `python`; if neither works, the session banner is replaced
+   by a `[allostat] BROKEN INSTALL` notice naming the fix.
+4. Run the session-start hook manually to see what it would emit
+   (use `python` instead of `python3` on Windows):
    ```
-   echo '{"hook_event_name":"SessionStart","session_id":"test","cwd":"."}' | python ~/.claude/plugins/allostat-mcp/hooks/session-start.py
+   echo '{"hook_event_name":"SessionStart","session_id":"test","cwd":"."}' | python3 ~/.claude/plugins/allostat-mcp/hooks/session-start.py
    ```
 
 **Server unreachable / 401 / 429**
